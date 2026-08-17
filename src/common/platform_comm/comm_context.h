@@ -33,6 +33,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "common/dma_workspace.h"
+
 static constexpr uint32_t COMM_MAX_RANK_NUM = 64;
 
 struct CommContext {
@@ -73,3 +75,61 @@ static_assert(offsetof(CommContext, rankNum) == 20, "CommContext layout drift");
 static_assert(offsetof(CommContext, winSize) == 24, "CommContext layout drift");
 static_assert(offsetof(CommContext, windowsIn) == 32, "CommContext layout drift");
 static_assert(offsetof(CommContext, windowsOut) == 544, "CommContext layout drift");
+
+// Per-domain async-DMA workspace slots, one per DmaWorkspaceKind.
+//
+// CommContext carries a single workSpace/workSpaceSize pair, which cannot
+// express "this domain uses SDMA and URMA at the same time". Widening it is not
+// an option: the layout above is byte-locked against pto-isa. So the slots live
+// in a simpler-private trailer appended after the mirrored prefix instead.
+//
+// `magic` exists because the device side reaches the table by casting a
+// CommContext* it was handed, with no way to know whether the allocation behind
+// it actually carries the trailer. A context produced by an older host, or one
+// whose trailer bytes were never written, reads as garbage; the accessor checks
+// the magic and returns nullptr rather than handing a kernel a bogus address.
+static constexpr uint32_t COMM_ASYNC_WORKSPACE_MAGIC = 0x53414D57u;  // 'SAMW'
+static constexpr uint32_t COMM_ASYNC_WORKSPACE_VERSION = 1u;
+
+struct CommAsyncWorkspaceTable {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t addr[DMA_WORKSPACE_KIND_COUNT];
+    uint64_t size[DMA_WORKSPACE_KIND_COUNT];
+};
+
+// What the host actually allocates for every device context. The CommContext
+// prefix is what pto-isa sees; the trailer is ours. Because `ctx` sits at offset
+// 0, the pointer handed out as `device_ctx_out` is unchanged -- pto-isa keeps
+// reading the same bytes at the same addresses, and simpler recovers the table
+// by casting back to the block.
+struct CommContextBlock {
+    CommContext ctx;
+    CommAsyncWorkspaceTable async;
+};
+
+static_assert(offsetof(CommContextBlock, ctx) == 0, "CommContextBlock prefix must alias CommContext");
+static_assert(offsetof(CommContextBlock, async) == 1056, "CommContextBlock trailer offset drift");
+static_assert(sizeof(CommContextBlock) == 1096, "CommContextBlock size drift");
+
+// Device-side accessor for the per-domain async trailer. Available only in
+// translation units that define __gm__ (AICore kernels). Host code must not
+// call this — the trailer is filled on the host via CommAsyncWorkspaceTable.
+//
+// Recovers the block by casting through the offset-0 CommContext prefix, then
+// checks magic/version so a context published without a trailer (or with a
+// stale one) yields nullptr instead of a garbage workspace address.
+#ifdef __gm__
+#ifndef __aicore__
+#define __aicore__
+#endif
+static __aicore__ inline __gm__ uint8_t *get_comm_dma_workspace(__gm__ CommContext *ctx, int kind) {
+    if (ctx == nullptr || kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return nullptr;
+    __gm__ CommContextBlock *block = reinterpret_cast<__gm__ CommContextBlock *>(ctx);
+    if (block->async.magic != COMM_ASYNC_WORKSPACE_MAGIC || block->async.version != COMM_ASYNC_WORKSPACE_VERSION) {
+        return nullptr;
+    }
+    uint64_t addr = block->async.addr[kind];
+    return addr == 0 ? nullptr : reinterpret_cast<__gm__ uint8_t *>(addr);
+}
+#endif

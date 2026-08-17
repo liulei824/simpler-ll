@@ -38,7 +38,7 @@ into `**config` and validated later. The recognized keys:
 | `device_id` | L2 | the single chip this worker drives |
 | `device_ids` | L3+ | one chip child process per entry |
 | `num_sub_workers` | L3+ | host-side Python callables to fork |
-| `enable_sdma` | a2a3 | provisions the SDMA workspace; defaults to `False` |
+| `enable_sdma` | a2a3 | provisions the SDMA workspace for kernels with no communication domain; defaults to `False`. Domain kernels use `allocate_domain(engines=...)` instead |
 | `heap_ring_size` | all | heap ring sizing |
 | `remote_heap_ring_size`, `remote_session_timeout_s` | L4 | remote-session sizing and timeout |
 
@@ -86,7 +86,7 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | ------ | ----- |
 | `submit_next_level(callable_handle, args, config=None, *, worker: int)` | Hands a `ChipCallable` to one chip child. `worker` is keyword-only |
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
-| `allocate_domain(name, workers, window_size, buffers=[...])` | Context manager returning a handle indexed by domain-local rank |
+| `allocate_domain(name, workers, window_size, buffers=[...], engines=())` | Context manager returning a handle indexed by domain-local rank. `engines` names the async-DMA engines the domain may use (`"sdma"`, `"urma"`) |
 | `malloc(worker_id, size) -> int` | **Argument order is `(worker_id, size)`** — the reverse of `Worker.malloc(size, worker_id=0)` |
 
 ## Callables and task args

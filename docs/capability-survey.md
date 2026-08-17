@@ -220,15 +220,16 @@ values yield `PTO2_ERROR_ASYNC_COMPLETION_INVALID`.
 | Engine | a2a3 | a5 | Status |
 | ------ | ---- | -- | ------ |
 | COUNTER (default) | registered | registered | **Shipped** — `async_notify_demo` runs onboard on both arches and `deferred_notify_demo` runs in sim on both, through the `st-onboard-*` / `st-sim-*` jobs in `ci.yml`. Routed by `@pytest.mark.platforms`, no `skipif` |
-| SDMA | build macro forced ON; runtime opt-in | `option(... OFF)` | a2a3 **Shipped** (the "SDMA pytest (a2a3)" step in `ci.yml`); a5 not built |
+| SDMA | build macro forced ON; declared per domain | `option(... ON)` | a2a3 **Shipped** (the "SDMA pytest (a2a3)" step in `ci.yml`); a5 built but unverified for lack of hardware |
 | URMA | absent | full implementation | **Gated** — see below |
 | ROCE, CCU | enum only | enum only | **Name only** |
 
-**a2a3 SDMA is opt-in at runtime**, not "always on": the provider is always
-compiled, but provisioning the 48 STARS streams requires
-`Worker(..., enable_sdma=True)`, default `False`
-(`python/simpler/worker.py:4178`, `:4396`;
-`python/bindings/task_interface.cpp:1367`). It is quarantined from the general
+**SDMA is opt-in at runtime**, not "always on": the provider is always
+compiled, but provisioning the 48 STARS streams requires an explicit request —
+either `allocate_domain(engines=("sdma",))` for a domain kernel, or
+`Worker(..., enable_sdma=True)` (default `False`) for a kernel with no domain.
+Both entry points share one refcounted per-device provider
+(`src/common/platform/onboard/host/sdma_workspace_provider.h`). It is quarantined from the general
 CI sweep via `@pytest.mark.sdma` for a measured hazard: with 48
 device-only SDMA streams an AICore fault takes ~306 s to tear down versus ~0.3 s
 without, traced to a single 300,000 ms remote TRS event timeout
@@ -243,9 +244,10 @@ sit behind `PTO_URMA_SUPPORTED`, which is **defined nowhere in this repo and
 nowhere in the installed CANN pto headers**, so the `#else` branch returns
 `PTO2_ERROR_ASYNC_COMPLETION_INVALID` immediately. The host overlay macro is
 fully wired, so turning it on does not help — the device path stays unreachable.
-a5's SDMA and URMA overlays are mutually exclusive by CMake `FATAL_ERROR`
-because `CommContext` exposes a single `workSpace` pair
-(`src/a5/platform/onboard/host/CMakeLists.txt:49-53`).
+`PTO_URMA_SUPPORTED` is the only remaining blocker: both a5 overlays are now
+built together and each domain picks its engine through `engines=`, since the
+per-engine slots live in the `CommContextBlock` trailer rather than
+`CommContext`'s single `workSpace` pair.
 
 **HCCL is bootstrap, not data movement.** The complete set of functions called
 is `HcclGetRootInfo`, `HcclCommInitRootInfo`, `HcclBarrier`, `HcclCommDestroy`.
@@ -300,7 +302,7 @@ re-check before editing.
 | `dynamic-linking.md:355-361` | AICPU launches before AICore; call is `rtKernelLaunch` | AICore launches first; the call is `rtKernelLaunchWithHandleV2` |
 | `comm-domain.md:111` | window is VMM + shareable-handle import with `aclrtDeviceEnablePeerAccess` | a2a3 prefers Fabric V2 (`comm_hccl.cpp:762`); the doc never mentions Fabric |
 | `comm-domain.md:262-264` | a producer `CoreCallable` declares the SDMA workspace requirement | that API was removed by PR #1406 |
-| `investigations/2026-07-a2a3-sdma-fault-teardown.md:153` | `sdma_async_completion_demo` is "unaffected by this change" | that demo sets `enable_sdma=True` (test:134), as CI's own comment states |
+| `investigations/2026-07-a2a3-sdma-fault-teardown.md:153`, `:212` | `sdma_async_completion_demo` is "unaffected by this change", and later that it sets `enable_sdma=True` | the demo does provision SDMA, but now through `allocate_domain(engines=("sdma",))`; the `enable_sdma` flag was dropped from it |
 | `src/common/worker/pto_runtime_c_api.h:259` | "`config` carries block_dim (0 = auto)" | `CallConfig` has no such field — "There is no block_dim knob" (`src/common/task_interface/call_config.h:22`) |
 | `src/common/platform/sim/host/device_runner_base.h:62-64` | "an explicit block_dim is still honoured" | same as above |
 | `src/common/aicpu_loader/README.md:18-28`, `:47-51` | one `rtsFuncGetByName`; `device_id` in per-task `KernelArgs`; dispatcher under `build/lib/<arch>/onboard/<runtime>/` | loops all symbols; `device_id` lives on `InitArgs`; dispatcher is at `build/lib/<arch>/dispatcher/` |

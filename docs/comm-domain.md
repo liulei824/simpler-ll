@@ -22,6 +22,7 @@ with orch.allocate_domain(
     buffers=[                              # named slices carved from the window
         CommBufferSpec(name="scratch", dtype="float32", count=1024, nbytes=4096),
     ],
+    engines=("sdma",),                     # async-DMA engines this domain may use
 ) as handle:
     for chip_idx in handle.workers:
         domain = handle[chip_idx]          # -> ChipDomainContext
@@ -32,6 +33,9 @@ with orch.allocate_domain(
 `window_size` is validated on the orch thread **before** any chip-side
 allocation: if `sum(b.nbytes) > window_size`, `allocate_domain` raises
 `ValueError` immediately and no backend allocation is registered.
+
+`engines` defaults to `()`, meaning no async-DMA engine — see
+[Async-DMA engines are declared per domain](#async-dma-engines-are-declared-per-domain).
 
 ### `ChipDomainContext` (one per participating chip, via `handle[chip_idx]`)
 
@@ -177,7 +181,7 @@ symmetric window is realized:
 | Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles only. Cross-card P2P via `aclrtDeviceEnablePeerAccess` on both |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed before the subset barrier (`memset`) | window zeroed before the handle is announced (`aclrtMemset`) |
-| Async-DMA workspace | n/a | a2a3: opt-in per Worker (`enable_sdma`); a5: SDMA by default, URMA as an opt-in alternative |
+| Async-DMA workspace | n/a — a non-empty `engines=` is rejected | declared per domain via `allocate_domain(engines=...)`; a2a3 offers SDMA, a5 offers SDMA and URMA |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
@@ -190,24 +194,48 @@ point can erase a signal the owner has not yet waited on, and the owner then
 waits on it forever. The rank skew that opens that window grows with host load,
 so the resulting hang shows up only under a loaded box.
 
-On a2a3, async-DMA resources are a Worker-level opt-in, not a
-communication-domain property. Construct the Worker with `enable_sdma=True` and
-the runtime provisions the SDMA workspace once at init, latches its address into
-the resident `KernelArgs`, and injects it into every run's kernel
-`GlobalContext` (`get_dma_workspace`). A Worker without `enable_sdma` creates no
-SDMA streams and its kernels read a zero workspace address. The workspace is
-released at Worker finalize by ordinary stream/manager teardown.
-Communication-domain allocation does not create SDMA streams or carry the
-workspace through `CommContext`. Because an SDMA-enabled Worker's 48 STARS
-streams sit in the device fault/sync domain, a fault on that Worker slows its
-teardown; keep SDMA workloads on their own Worker (and, in CI, their own task)
-so ordinary workloads are unaffected — see
+### Async-DMA engines are declared per domain
+
+A domain that wants an async-DMA engine must say so:
+
+```python
+with orch.allocate_domain(name="tp", workers=[0, 1], window_size=..., engines=("sdma",)) as tp:
+    ...
+```
+
+Both onboard backends then fill that engine's slot in the domain's
+`CommContextBlock` trailer, and the kernel reads it with
+`get_comm_dma_workspace(comm_ctx, DMA_WORKSPACE_SDMA)`. Omitting `engines=`
+leaves every slot zero, so a kernel that asks for one gets `nullptr` and
+self-skips. Declaring an engine the platform or build does not offer is a hard
+failure, not a silent downgrade — on a2a3 that includes `"urma"`, and under
+simulation it includes every engine.
+
+Two properties of the declaration are worth stating explicitly:
+
+- **It is a capability gate, not an existence claim.** SDMA's workspace is one
+  shared per-device provider, so a domain that omits `"sdma"` while a sibling
+  domain on the same card declares it still leaves that provider alive; the
+  omitting domain simply cannot reach it. URMA is the opposite — its workspace
+  records per-peer connection state, so each domain gets its own.
+- **Release is asymmetric.** Releasing a domain destroys its URMA workspace but
+  not the SDMA provider, which is refcounted and torn down at comm teardown.
+
+`Worker(enable_sdma=True)` remains the separate, domain-less entry point: it
+provisions the same shared provider at init, latches the address into the
+resident `KernelArgs`, and injects it into every run's `GlobalContext` for
+`get_dma_workspace(args, kind)`. Use it only for kernels with no communication
+domain (`prefetch_async_demo`); domain kernels should declare `engines=`
+instead. It is honored only by the a2a3 onboard `tensormap_and_ringbuffer`
+runtime; host-build-graph and simulation builds fail Worker init fast when it
+is set.
+
+Either entry point brings up 48 STARS streams that sit in the device fault/sync
+domain, so a fault on that Worker slows its teardown. Keep SDMA workloads on
+their own Worker (and, in CI, their own task) so ordinary workloads are
+unaffected — see
 [docs/investigations/2026-07-a2a3-sdma-fault-teardown.md](investigations/2026-07-a2a3-sdma-fault-teardown.md)
-and issue #1425. `enable_sdma` is currently honored only by the a2a3 onboard
-`tensormap_and_ringbuffer` runtime; host-build-graph, simulation, a5, and
-provider-disabled builds fail Worker init fast when it is set. A5 provisions
-its communication-context SDMA workspace by default; this is separate from
-the callable-declared workspace mechanism controlled by `enable_sdma`.
+and issue #1425.
 
 ---
 
@@ -319,5 +347,5 @@ simpler stays framework-free — torch/numpy appear only on the caller's side.
 - `examples/workers/l3/dual_domain_overlap/` — overlapping domains where one
   worker participates in both.
 - `examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/` — host
-  staging via `copy_to` + cross-rank `SdmaTget`; the SDMA workspace is
-  provisioned by constructing the `Worker` with `enable_sdma=True`.
+  staging via `copy_to` + cross-rank `SdmaTget`; the SDMA workspace comes from
+  `allocate_domain(engines=("sdma",))`.

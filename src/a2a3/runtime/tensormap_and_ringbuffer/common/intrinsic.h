@@ -96,6 +96,10 @@
 #define __aicore__
 #endif
 
+// Brings get_comm_dma_workspace (per-domain trailer) after __gm__/__aicore__
+// are defined so the device-side inline is visible to kernels.
+#include "platform_comm/comm_context.h"
+
 /** Number of extra pointer slots appended to the args[] tail (LocalContext + GlobalContext). */
 static constexpr int32_t PTO2_EXT_PARAMS_COUNT = 2;
 

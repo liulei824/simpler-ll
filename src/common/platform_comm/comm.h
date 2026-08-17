@@ -37,6 +37,25 @@ extern "C" {
 
 typedef struct CommHandle_ *CommHandle;
 
+/**
+ * Revision of the C ABI declared in this header.
+ *
+ * These entry points are resolved by name with dlsym, which does not check
+ * signatures, so a host_runtime.so built before a signature change links
+ * cleanly and then corrupts the stack at the first call. ChipWorker::init
+ * loads comm_abi_version() and compares it against this constant, turning that
+ * class of mismatch into a load-time error: a stale .so either lacks the symbol
+ * (dlsym fails) or reports an older revision.
+ *
+ * Bump this whenever the signature or contract of any comm_* / dma_workspace_*
+ * entry point below changes.
+ *   1 -> 2: comm_alloc_domain_windows gained the engine_mask parameter.
+ */
+#define COMM_ABI_VERSION 2U
+
+/** Revision of the C ABI this host_runtime.so was built against. */
+uint32_t comm_abi_version(void);
+
 #define COMM_GLOBAL_DOMAIN_VERSION 1U
 #define COMM_GLOBAL_DOMAIN_HANDLE_BYTES 256U
 #define COMM_GLOBAL_DOMAIN_DESCRIPTOR_BYTES 288U
@@ -231,6 +250,14 @@ int comm_derive_context(
  * @param domain_rank             This caller's dense rank in the subset.
  * @param window_size             Bytes per rank.  Backend must allocate
  *                                exactly this size; no auto-rounding.
+ * @param engine_mask             Bit mask of DmaWorkspaceKind values naming the
+ *                                async engines this domain will use; 0 requests
+ *                                none.  Declaration is explicit — a domain does
+ *                                not get an engine it did not ask for.
+ *                                A mask naming an engine the backend does not
+ *                                support hard-fails the allocation: a2a3 offers
+ *                                SDMA, a5 offers SDMA and/or URMA per its CMake
+ *                                options, and sim rejects any non-zero mask.
  * @param device_ctx_out          Receives a device pointer to a new
  *                                CommContext for the subset.
  * @param local_window_base_out   Receives this rank's local window start
@@ -240,7 +267,7 @@ int comm_derive_context(
  */
 int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint32_t engine_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out
 );
 
 /**

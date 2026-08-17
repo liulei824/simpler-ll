@@ -78,7 +78,7 @@ import uuid
 from dataclasses import dataclass, field
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any, cast
+from typing import Any, Sequence, cast
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -471,10 +471,33 @@ _CTRL_SHM_NAME_BYTES = 32
 # Domain-allocation request shm layout: 32-byte header + buffer_nbytes (u64) +
 # rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
 # of rank_count parity; rank_ids come last (u32 has no alignment concern).
-_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI4x")
+_DOMAIN_REQ_HEADER = struct.Struct("<QIIQII")
 # fields: allocation_id (u64), rank_count (u32), domain_rank (u32),
-#         window_size (u64), buffer_count (u32), padding (4 bytes)
+#         window_size (u64), buffer_count (u32), engine_mask (u32)
 assert _DOMAIN_REQ_HEADER.size == 32
+
+# Must match DmaWorkspaceKind in src/common/platform/include/common/dma_workspace.h.
+_DMA_WORKSPACE_SDMA = 0
+_DMA_WORKSPACE_URMA = 1
+_ENGINE_NAME_TO_BIT = {
+    "sdma": 1 << _DMA_WORKSPACE_SDMA,
+    "urma": 1 << _DMA_WORKSPACE_URMA,
+}
+
+
+def _engines_to_mask(engines: Sequence[str] | None) -> int:
+    """Translate allocate_domain(engines=...) names into a DmaWorkspaceKind bitmask."""
+    if not engines:
+        return 0
+    mask = 0
+    for name in engines:
+        key = str(name).strip().lower()
+        bit = _ENGINE_NAME_TO_BIT.get(key)
+        if bit is None:
+            known = ", ".join(sorted(_ENGINE_NAME_TO_BIT))
+            raise ValueError(f"allocate_domain: unknown engine {name!r}; expected one of: {known}")
+        mask |= bit
+    return mask
 
 # Domain-allocation reply shm layout: 32-byte header + buffer_ptrs (u64).
 _DOMAIN_REPLY_HEADER = struct.Struct("<QQQI4x")
@@ -1902,7 +1925,9 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
     req_buf = req_shm.buf
     assert req_buf is not None
     try:
-        (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+        (allocation_id, rank_count, domain_rank, window_size, buffer_count, engine_mask) = (
+            _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+        )
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
         nbytes_offset = _DOMAIN_REQ_HEADER.size
         nbytes_struct = struct.Struct(f"<{buffer_count}Q") if buffer_count else struct.Struct("")
@@ -1930,6 +1955,7 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
             int(domain_rank),
             int(window_size),
             _buffer_field_addr(reply_buf, _OFF_DOMAIN_REPLY_COMMITTED),
+            int(engine_mask),
         )
 
         # Carve buffer pointers sequentially inside the local window.
@@ -2403,7 +2429,7 @@ def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
     req_buf = req_shm.buf
     assert req_buf is not None
     try:
-        (allocation_id, rank_count, domain_rank, _ws, _bc) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+        (allocation_id, rank_count, domain_rank, _ws, _bc, _engines) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
     finally:
         req_buf.release()
         req_shm.close()
@@ -7907,12 +7933,14 @@ class Worker:
         workers: tuple[int, ...],
         window_size: int,
         buffers: list[CommBufferSpec],
+        engines: Sequence[str] = (),
     ) -> CommDomainHandle:
         # Admission is the run() lease that the driving orchestrator holds;
         # validation checks resource presence rather than the public lifecycle,
         # so an allocation admitted before concurrent close still drains.
         # Buffer carving is checked before communicator/device side effects.
         resources = _validate_domain_allocation(self, name, workers, window_size, buffers)
+        engine_mask = _engines_to_mask(engines)
 
         # Lazy base communicator: first orch.allocate_domain on this Worker
         # triggers HCCL RootInfo handshake + EnablePeerAccess on every chip.
@@ -7957,6 +7985,7 @@ class Worker:
                         int(worker_to_rank[chip_idx]),  # domain_rank
                         int(window_size),
                         int(buffer_count),
+                        int(engine_mask),
                     )
                     nbytes_off = _DOMAIN_REQ_HEADER.size
                     if buffer_count:
@@ -8288,6 +8317,7 @@ class Worker:
                     int(handle._domain_ranks[chip_idx]),  # noqa: SLF001 -- preserve the allocation-time rank
                     0,  # window_size — ignored on release
                     0,  # buffer_count — ignored on release
+                    0,  # engine_mask — ignored on release
                 )
             self._dispatch_control_domain(
                 workers=workers,

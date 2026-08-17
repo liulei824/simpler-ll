@@ -56,6 +56,7 @@ workspace address:
 | `get_block_num(args)` | total logical blocks for this task | per-dispatch | `LocalContext.block_num` |
 | `get_sub_block_id(args)` | AIV lane in cluster (0 = AIV0, 1 = AIV1) | per-core, init once | `GlobalContext.sub_block_id` |
 | `get_dma_workspace(args, kind)` | engine workspace GM pointer, or `nullptr` | Worker init (SDMA-enabled) | `GlobalContext.dma_workspace[kind]` |
+| `get_comm_dma_workspace(comm_ctx, kind)` | same, for a communication domain | that domain's `allocate_domain` .. `release_domain` | the domain's `CommContextBlock` trailer |
 
 `sub_block_id` is **only meaningful for AIV kernels in MIX tasks**.
 AIC kernels and single-AIV tasks should not depend on it. AIV0 is the
@@ -79,6 +80,24 @@ mechanism.
 An invalid kind or unprovisioned slot returns `nullptr` and must not be used to
 submit DMA work. `LocalContext` is rewritten by `build_payload()` before each
 dispatch.
+
+#### Which workspace accessor to use
+
+The two accessors are not interchangeable, and the difference is lifetime:
+
+| Your kernel | Accessor | Why |
+| ----------- | -------- | --- |
+| has no communication domain | `get_dma_workspace(args, kind)` | the address is a Worker-level resource injected into every dispatch |
+| receives a `CommContext *` | `get_comm_dma_workspace(comm_ctx, kind)` | the address belongs to that domain and dies with it |
+
+A domain kernel must not fall back to `get_dma_workspace`: a Worker built
+without `enable_sdma` leaves that slot zero even when the domain declared the
+engine, so the kernel would self-skip on a workspace it actually has. The
+converse fails too — a domain that omitted `engines=` has a zeroed trailer.
+
+`get_comm_dma_workspace` recovers the trailer by casting through the
+`CommContext` prefix and checking a magic/version stamp, so a context published
+without a trailer yields `nullptr` rather than a garbage address.
 
 ### Logical vs physical block_dim
 

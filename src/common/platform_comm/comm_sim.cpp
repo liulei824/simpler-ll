@@ -34,6 +34,7 @@
  */
 
 #include "platform_comm/comm.h"
+#include "platform_comm/comm_async_workspace.h"
 #include "platform_comm/comm_context.h"
 
 #include <cerrno>
@@ -162,7 +163,7 @@ struct DomainAllocation {
     void *mmap_base = nullptr;
     size_t mmap_size = 0;
     bool is_creator = false;
-    std::unique_ptr<CommContext> host_ctx;  // device_ctx points here on sim
+    std::unique_ptr<CommContextBlock> host_block;  // device_ctx points at its ctx prefix on sim
 };
 
 struct GlobalPeerMapping {
@@ -216,7 +217,7 @@ struct GlobalDomainAllocation {
     void *local_base = nullptr;
     size_t mapping_size = 0;
     std::vector<GlobalPeerMapping> peer_mappings;
-    std::unique_ptr<CommContext> host_ctx;
+    std::unique_ptr<CommContextBlock> host_block;
 };
 
 static_assert(sizeof(CommGlobalDomainDescriptor) == 288, "global domain descriptor ABI changed");
@@ -231,8 +232,8 @@ struct CommHandle_ {
     size_t mmap_size = 0;
     bool is_creator = false;
 
-    CommContext host_ctx{};
-    std::vector<CommContext *> derived_contexts;
+    CommContextBlock host_block{};
+    std::vector<CommContextBlock *> derived_contexts;
     // Domain allocations keyed by allocation_id.  Single-orch-thread access
     // pattern: alloc / release / lookup all happen on the chip child's
     // control-mailbox handler thread, so no extra synchronisation needed.
@@ -275,6 +276,8 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     std::fprintf(stderr, "[comm_sim rank %d] comm_init: unknown exception\n", rank);
     return nullptr;
 }
+
+extern "C" uint32_t comm_abi_version(void) { return COMM_ABI_VERSION; }
 
 extern "C" uint32_t dma_workspace_supported_mask(void) { return 0; }
 
@@ -377,7 +380,8 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *devic
     // only dereference their own rank's CommContext; the hardware UT's
     // cross-rank address-agreement assert is specifically an HCCL-GVA
     // invariant and is not expected to hold (nor intended to run) under sim.
-    auto &ctx = h->host_ctx;
+    h->host_block.async = make_empty_comm_async_table();
+    auto &ctx = h->host_block.ctx;
     ctx.workSpace = 0;
     ctx.workSpaceSize = 0;
     ctx.rankId = static_cast<uint32_t>(h->rank);
@@ -391,7 +395,7 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *devic
         ctx.windowsOut[i] = addr;
     }
 
-    *device_ctx_out = reinterpret_cast<uint64_t>(&h->host_ctx);
+    *device_ctx_out = reinterpret_cast<uint64_t>(&h->host_block.ctx);
 
     __atomic_add_fetch(&hdr->ready_count, 1, __ATOMIC_ACQ_REL);
     bool all_ready = wait_until(
@@ -418,13 +422,13 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *devic
 
 extern "C" int comm_get_local_window_base(CommHandle h, uint64_t *base_out) {
     if (h == nullptr || base_out == nullptr) return -1;
-    *base_out = h->host_ctx.windowsIn[h->rank];
+    *base_out = h->host_block.ctx.windowsIn[h->rank];
     return 0;
 }
 
 extern "C" int comm_get_window_size(CommHandle h, size_t *size_out) {
     if (h == nullptr || size_out == nullptr) return -1;
-    *size_out = static_cast<size_t>(h->host_ctx.winSize);
+    *size_out = static_cast<size_t>(h->host_block.ctx.winSize);
     return 0;
 }
 
@@ -444,18 +448,21 @@ extern "C" int comm_derive_context(
         );
         return -1;
     }
-    if (window_offset + window_size > static_cast<size_t>(h->host_ctx.winSize)) {
+    if (window_offset + window_size > static_cast<size_t>(h->host_block.ctx.winSize)) {
         std::fprintf(
             stderr, "[comm_sim rank %d] comm_derive_context: window range [%zu, %zu) exceeds base window size %llu\n",
-            h->rank, window_offset, window_offset + window_size, static_cast<unsigned long long>(h->host_ctx.winSize)
+            h->rank, window_offset, window_offset + window_size,
+            static_cast<unsigned long long>(h->host_block.ctx.winSize)
         );
         return -1;
     }
 
-    auto *ctx = new (std::nothrow) CommContext{};
-    if (ctx == nullptr) return -1;
-    ctx->workSpace = h->host_ctx.workSpace;
-    ctx->workSpaceSize = h->host_ctx.workSpaceSize;
+    auto *block = new (std::nothrow) CommContextBlock{};
+    if (block == nullptr) return -1;
+    block->async = make_empty_comm_async_table();
+    CommContext *ctx = &block->ctx;
+    ctx->workSpace = h->host_block.ctx.workSpace;
+    ctx->workSpaceSize = h->host_block.ctx.workSpaceSize;
     ctx->rankId = domain_rank;
     ctx->rankNum = static_cast<uint32_t>(rank_count);
     ctx->winSize = window_size;
@@ -466,14 +473,14 @@ extern "C" int comm_derive_context(
                 stderr, "[comm_sim rank %d] comm_derive_context: rank_ids[%zu]=%u out of range [0, %d)\n", h->rank, i,
                 base_rank, h->nranks
             );
-            delete ctx;
+            delete block;
             return -1;
         }
-        ctx->windowsIn[i] = h->host_ctx.windowsIn[base_rank] + window_offset;
-        ctx->windowsOut[i] = h->host_ctx.windowsOut[base_rank] + window_offset;
+        ctx->windowsIn[i] = h->host_block.ctx.windowsIn[base_rank] + window_offset;
+        ctx->windowsOut[i] = h->host_block.ctx.windowsOut[base_rank] + window_offset;
     }
 
-    h->derived_contexts.push_back(ctx);
+    h->derived_contexts.push_back(block);
     *device_ctx_out = reinterpret_cast<uint64_t>(ctx);
     return 0;
 } catch (const std::exception &e) {
@@ -527,8 +534,18 @@ extern "C" int comm_barrier(CommHandle h) {
 
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint32_t engine_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out
 ) try {
+    // Sim has no async-DMA hardware. An explicit engine request is a hard
+    // failure (matches onboard "declared but unsupported" policy); mask 0
+    // leaves the trailer empty and kernels self-skip.
+    if (engine_mask != 0) {
+        std::fprintf(
+            stderr, "[comm_sim rank %d] alloc_domain: engine_mask=0x%x unsupported under simulation\n",
+            h != nullptr ? h->rank : -1, engine_mask
+        );
+        return -1;
+    }
     if (h == nullptr || rank_ids == nullptr || device_ctx_out == nullptr || local_window_base_out == nullptr) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         std::fprintf(
@@ -630,8 +647,9 @@ extern "C" int comm_alloc_domain_windows(
     }
 
     auto *win_base = static_cast<uint8_t *>(base) + HEADER_SIZE;
-    alloc->host_ctx = std::make_unique<CommContext>();
-    auto &ctx = *alloc->host_ctx;
+    alloc->host_block = std::make_unique<CommContextBlock>();
+    alloc->host_block->async = make_empty_comm_async_table();
+    auto &ctx = alloc->host_block->ctx;
     ctx.workSpace = 0;
     ctx.workSpaceSize = 0;
     ctx.rankId = domain_rank;
@@ -668,7 +686,7 @@ extern "C" int comm_alloc_domain_windows(
         return -1;
     }
 
-    *device_ctx_out = reinterpret_cast<uint64_t>(alloc->host_ctx.get());
+    *device_ctx_out = reinterpret_cast<uint64_t>(&alloc->host_block->ctx);
     *local_window_base_out = reinterpret_cast<uint64_t>(local_window);
     h->domain_allocations.emplace(allocation_id, std::move(alloc));
     return 0;
@@ -815,7 +833,7 @@ extern "C" int comm_global_domain_import(
         return -1;
     }
     auto &allocation = it->second;
-    if (descriptor_count != allocation->nranks || allocation->host_ctx != nullptr) {
+    if (descriptor_count != allocation->nranks || allocation->host_block != nullptr) {
         return -1;
     }
 
@@ -832,7 +850,9 @@ extern "C" int comm_global_domain_import(
         rank_order[descriptor.domain_rank] = &descriptor;
     }
 
-    auto ctx = std::make_unique<CommContext>();
+    auto block = std::make_unique<CommContextBlock>();
+    block->async = make_empty_comm_async_table();
+    CommContext *ctx = &block->ctx;
     ctx->rankId = allocation->rank;
     ctx->rankNum = allocation->nranks;
     ctx->winSize = allocation->mapping_size;
@@ -864,8 +884,8 @@ extern "C" int comm_global_domain_import(
     }
 
     allocation->peer_mappings = std::move(peer_mappings);
-    *device_ctx_out = reinterpret_cast<uint64_t>(ctx.get());
-    allocation->host_ctx = std::move(ctx);
+    *device_ctx_out = reinterpret_cast<uint64_t>(ctx);
+    allocation->host_block = std::move(block);
     return 0;
 } catch (const std::exception &e) {
     std::fprintf(stderr, "[comm_sim] global_domain_import: exception: %s\n", e.what());

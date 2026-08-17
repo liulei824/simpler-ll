@@ -29,6 +29,11 @@ _REMOVED_AMBIENT_SELECTION_SYMBOLS = {
     "set_native_run_identity_ctx",
     "set_task_accepted_state_ctx",
 }
+# ChipWorker.init resolves this before the rest of the comm group and refuses a
+# runtime whose reported COMM_ABI_VERSION differs. nm can only prove the symbol
+# is there -- C symbols carry no signature -- but its absence is what a runtime
+# built before the versioned comm ABI looks like.
+_NEWLY_REQUIRED_COMM_SYMBOLS = {"comm_abi_version"}
 
 _SIM_CASES = [
     pytest.param(arch, "sim", runtime, id=f"{arch}-sim-{runtime}")
@@ -73,4 +78,5 @@ def test_host_runtime_exports_required_pipeline_symbols(arch: str, variant: str,
     symbols = _defined_external_symbols(runtime_path)
 
     assert _NEWLY_REQUIRED_PIPELINE_SYMBOLS <= symbols, sorted(_NEWLY_REQUIRED_PIPELINE_SYMBOLS - symbols)
+    assert _NEWLY_REQUIRED_COMM_SYMBOLS <= symbols, sorted(_NEWLY_REQUIRED_COMM_SYMBOLS - symbols)
     assert symbols.isdisjoint(_REMOVED_AMBIENT_SELECTION_SYMBOLS), sorted(symbols & _REMOVED_AMBIENT_SELECTION_SYMBOLS)

@@ -49,10 +49,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ ChipTensor *out_tensor = reinterpret_cast<__gm__ ChipTensor *>(args[1]);
     __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[2]);
 
-    // A null workspace means the host runtime was not built with the URMA
-    // backend; self-skip rather than dereferencing it.
+    __gm__ uint8_t *workspace =
+        comm_ctx == nullptr ? nullptr : get_comm_dma_workspace(comm_ctx, DMA_WORKSPACE_URMA);
+    // A null workspace means the domain was not allocated with engines=("urma",)
+    // or the host runtime was not built with the URMA backend.
     if (comm_ctx == nullptr || comm_ctx->rankNum != 2 || comm_ctx->rankId >= comm_ctx->rankNum ||
-        comm_ctx->workSpace == 0 || comm_ctx->windowsIn[comm_ctx->rankId] == 0) {
+        workspace == nullptr || comm_ctx->windowsIn[comm_ctx->rankId] == 0) {
         pipe_barrier(PIPE_ALL);
         return;
     }
@@ -61,9 +63,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float *local_out = tensor_data<float>(out_tensor);
     uint32_t peer_rank = 1u - comm_ctx->rankId;
     uint64_t input_offset = reinterpret_cast<uint64_t>(local_input) - comm_ctx->windowsIn[comm_ctx->rankId];
-    __gm__ float *remote_input = pto2::urma_backend::peer_mr_ptr<float>(
-        reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer_rank, input_offset
-    );
+    __gm__ float *remote_input = pto2::urma_backend::peer_mr_ptr<float>(workspace, peer_rank, input_offset);
 
     using FlatShape = Shape<1, 1, 1, 1, kElems>;
     using FlatStride = pto::Stride<kElems, kElems, kElems, kElems, 1>;
@@ -73,8 +73,5 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     GlobalData local_global(local_out);
 
     AsyncCtx async_ctx = get_async_ctx(args);
-    (void)send_request_entry(
-        async_ctx,
-        UrmaTget(local_global, remote_global, reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer_rank)
-    );
+    (void)send_request_entry(async_ctx, UrmaTget(local_global, remote_global, workspace, peer_rank));
 }

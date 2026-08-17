@@ -43,11 +43,11 @@ enum class SdmaOp : uint8_t {
 // time; the SdmaTget() / SdmaTput() helpers below let callers skip the
 // template arguments.
 //
-// sync_id selects which event-record slot inside the workspace the engine
-// writes into. Concurrent dispatches must use distinct sync_ids; today every
-// caller submits one request per kernel invocation so passing 0 is safe.
-// Future work
-// will fold sync_id allocation into the adapter.
+// sync_id is the AI-core pipe-sync event id passed into BuildAsyncSession /
+// PrepareEventCheck — not a workspace partitioning key (that is
+// channelGroupIdx). Concurrent dispatches that share a core must use distinct
+// sync_ids; today every caller submits one request per kernel invocation so
+// passing 0 is safe. Future work will fold sync_id allocation into the adapter.
 template <typename DstTensor, typename SrcTensor, typename ScratchTileT>
 struct SdmaRequestDescriptor {
     SdmaOp op;

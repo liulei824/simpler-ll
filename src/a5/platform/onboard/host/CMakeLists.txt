@@ -34,16 +34,11 @@ else()
 endif()
 set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
 
-option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "Enable a5 PTO URMA workspace overlay" OFF)
-# SDMA is the default a5 async-workspace backend. URMA remains an explicit
-# alternative because CommContext exposes one workSpace/workSpaceSize pair.
-# SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is an internal compile marker, not a
-# user-configurable option.
-if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OFF)
-else()
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
-endif()
+# SDMA and URMA are independent overlays: a single a5 onboard build can carry
+# both. CommContextBlock's per-engine trailer slots replaced the old single
+# workSpace pair that forced mutual exclusion.
+option(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE "Enable a5 PTO SDMA workspace overlay" ON)
+option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "Enable a5 PTO URMA workspace overlay" ON)
 
 # Pin-resolved checkout path is passed by RuntimeBuilder as -DPTO_ISA_ROOT=
 # (#1403). Do not read $ENV{PTO_ISA_ROOT} — ambient exports are not the pin.
@@ -81,6 +76,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_phase_capture.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/sdma_workspace_provider.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})

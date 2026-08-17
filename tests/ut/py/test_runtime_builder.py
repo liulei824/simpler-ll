@@ -410,7 +410,8 @@ class TestRuntimeBuilderGetBinaries:
 
         host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
         assert host_call.kwargs["cmake_defines"]["SIMPLER_PTO_ISA_BUILD_COMMIT"] == pin
-        assert "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" not in host_call.kwargs["cmake_defines"]
+        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_SDMA_WORKSPACE"] == "ON"
+        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "ON"
         assert host_call.kwargs["cmake_defines"]["PTO_ISA_ROOT"] == "/tmp/pto-isa"
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")

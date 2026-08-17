@@ -23,10 +23,11 @@
  * Shared by host (provisioning + InitArgs) and device (scheduler + kernels),
  * so it carries no dependencies beyond the enum itself.
  *
- * Current support matrix: SDMA is available only on a2a3 onboard with the
- * tensormap_and_ringbuffer runtime. URMA is reserved for the future a5
- * per-domain provider. Host-build-graph, simulation, a5, and builds without
- * the a2a3 PTO-SDMA provider reject non-empty requirements at registration.
+ * Current support matrix (dma_workspace_supported_mask):
+ *   - a2a3 onboard: SDMA (Worker-init GlobalContext injection + shared provider)
+ *   - a5 onboard: SDMA and/or URMA (independent CMake options; domain trailer
+ *     slots via allocate_domain(engines=...); URMA is always per-domain)
+ *   - simulation / host_build_graph: mask 0 (reject non-empty requirements)
  */
 
 #ifndef PLATFORM_COMMON_DMA_WORKSPACE_H_
@@ -34,7 +35,7 @@
 
 enum DmaWorkspaceKind {
     DMA_WORKSPACE_SDMA = 0,  // PTO-ISA async-SDMA (a2a3): TPREFETCH_ASYNC / TGET_ASYNC / TPUT_ASYNC
-    DMA_WORKSPACE_URMA = 1,  // Reserved for the future a5 URMA async engine
+    DMA_WORKSPACE_URMA = 1,  // PTO-ISA async-URMA (a5): per-domain, via allocate_domain(engines=)
     DMA_WORKSPACE_KIND_COUNT = 2,
 };
 

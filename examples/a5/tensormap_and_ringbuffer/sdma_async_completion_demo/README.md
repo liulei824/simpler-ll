@@ -18,18 +18,19 @@ The remote address is plain symmetric-window arithmetic — take the local
 pointer's offset from `windowsIn[rankId]` and add it to `windowsIn[peer_rank]`.
 Every rank's window is laid out identically, so an offset is rank-independent.
 
+The transfer kernel reads the SDMA workspace from the domain trailer via
+`get_comm_dma_workspace(comm_ctx, DMA_WORKSPACE_SDMA)`. The domain must be
+allocated with `engines=("sdma",)`.
+
 ## Requirements
 
-The a5 host runtime includes the PTO async-SDMA workspace by default:
+The a5 host runtime builds with SDMA and URMA overlays both available by
+default. This demo only needs the SDMA slot filled for its domain.
 
 | Gate | Effect |
 | ---- | ------ |
 | `@pytest.mark.platforms(["a5"])` | deselected on any other `--platform` |
 | `@pytest.mark.device_count(2)` | needs two dies |
-| `@pytest.mark.skipif(_urma_workspace_enabled())` | skipped when `SIMPLER_ENABLE_PTO_URMA_WORKSPACE` selects the URMA backend |
-
-URMA replaces SDMA in a URMA build. Rebuild without
-`SIMPLER_ENABLE_PTO_URMA_WORKSPACE` before running this demo.
 
 ```bash
 pytest examples/a5/tensormap_and_ringbuffer/sdma_async_completion_demo \
@@ -40,5 +41,5 @@ Wrap the hardware run in `task-submit` on a shared box.
 
 ## Compare with
 
-- [`../urma_deferred_completion_demo/`](../urma_deferred_completion_demo/) — the same protocol over URMA. `kernel_consumer.cpp` is byte-identical; only the transfer kernel, its completion header, and the build flag differ. **The two overlays are mutually exclusive in one build**, so comparing them means rebuilding — that README has the detail.
-- [`examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/`](../../../a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/) — the a2a3 port of this demo, which needs no overlay flag.
+- [`../urma_deferred_completion_demo/`](../urma_deferred_completion_demo/) — the same protocol over URMA. `kernel_consumer.cpp` is byte-identical; only the transfer kernel, completion header, and `engines=("urma",)` declaration differ. Both demos can pass against the same host runtime build.
+- [`examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/`](../../../a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/) — the a2a3 port of this demo.

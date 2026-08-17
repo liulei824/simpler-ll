@@ -383,3 +383,36 @@ class TestDynamicAllocateInterleavedSubsets:
         for chip_idx in (1, 2):
             # Distinct allocations → distinct local window bases (different shms).
             assert captured[f"chip{chip_idx}_left_base"] != captured[f"chip{chip_idx}_right_base"]
+
+
+# ---------------------------------------------------------------------------
+# engines= negative paths (stage-2 async workspace unify)
+# ---------------------------------------------------------------------------
+
+
+class TestAllocateDomainEngines:
+    def test_unknown_engine_name_raises(self):
+        from simpler.worker import _engines_to_mask
+
+        with pytest.raises(ValueError, match="unknown engine"):
+            _engines_to_mask(("not-an-engine",))
+
+    def test_sim_rejects_declared_engines(self):
+        """Sim has no async-DMA; non-empty engines= must hard-fail at alloc."""
+        from simpler.task_interface import CallConfig
+
+        def orch_fn(orch, _args, _cfg):
+            orch.allocate_domain(
+                name="tp",
+                workers=[0, 1],
+                window_size=4096,
+                engines=("sdma",),
+            )
+
+        worker = _make_worker(nranks=2)
+        try:
+            worker.init()
+            with pytest.raises(Exception):
+                worker.run(orch_fn, args=None, config=CallConfig())
+        finally:
+            worker.close()

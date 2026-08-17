@@ -145,7 +145,14 @@ void ChipWorker::init(
     }
 
     GetPipelineContractFn get_pipeline_contract_fn = nullptr;
+    CommAbiVersionFn comm_abi_version_fn = nullptr;
     try {
+        // Resolved before anything else in the comm group. dlsym matches on name
+        // alone, so a host_runtime.so built against an older comm.h would bind
+        // happily and then be called through the wrong signature. Loading this
+        // first turns that into a load-time failure: a stale .so either has no
+        // such symbol or reports a version we reject below.
+        comm_abi_version_fn = load_symbol<CommAbiVersionFn>(handle, "comm_abi_version");
         create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
         destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
         device_malloc_ctx_fn_ = load_symbol<DeviceMallocCtxFn>(handle, "device_malloc_ctx");
@@ -201,6 +208,15 @@ void ChipWorker::init(
     } catch (...) {
         dlclose(handle);
         throw;
+    }
+
+    const uint32_t runtime_abi_version = comm_abi_version_fn();
+    if (runtime_abi_version != COMM_ABI_VERSION) {
+        dlclose(handle);
+        throw std::runtime_error(
+            "host runtime comm ABI version " + std::to_string(runtime_abi_version) + " does not match the expected " +
+            std::to_string(COMM_ABI_VERSION) + "; rebuild the runtimes"
+        );
     }
 
     const PipelineContract *contract = get_pipeline_contract_fn();
@@ -1116,7 +1132,7 @@ uint64_t ChipWorker::comm_derive_context(
 
 std::pair<uint64_t, uint64_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-    size_t window_size
+    size_t window_size, uint32_t engine_mask
 ) {
     if (comm_alloc_domain_windows_fn_ == nullptr) {
         throw std::runtime_error("comm_alloc_domain_windows is not supported by this runtime");
@@ -1134,7 +1150,7 @@ std::pair<uint64_t, uint64_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t local_window_base = 0;
     int rc = comm_alloc_domain_windows_fn_(
         reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
-        window_size, &device_ctx, &local_window_base
+        window_size, engine_mask, &device_ctx, &local_window_base
     );
     if (rc != 0) {
         throw std::runtime_error("comm_alloc_domain_windows failed with code " + std::to_string(rc));

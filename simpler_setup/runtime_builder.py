@@ -364,9 +364,17 @@ class RuntimeBuilder:
 
                         pto_root = ensure_pto_isa_root(verbose=True)
                     defines["PTO_ISA_ROOT"] = pto_root
-                for opt_in_define in ("SIMPLER_ENABLE_PTO_URMA_WORKSPACE",):
-                    if os.environ.get(opt_in_define, "").upper() in {"1", "ON", "TRUE", "YES"}:
-                        defines[opt_in_define] = "ON"
+                # a5 overlays are independent and both default ON. Pass them
+                # explicitly so a stale CMakeCache from the old "URMA replaces
+                # SDMA" layout cannot keep URMA OFF across rebuilds. Env can
+                # force either OFF; any other/absent value keeps the default.
+                if self._arch == "a5" and self._variant == "onboard":
+                    for define in (
+                        "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
+                        "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
+                    ):
+                        env_val = os.environ.get(define, "").upper()
+                        defines[define] = "OFF" if env_val in {"0", "OFF", "FALSE", "NO"} else "ON"
                 cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir
             cache_dir = self._CACHE_DIR / arch / variant / name

@@ -23,7 +23,9 @@
  */
 
 #include "platform_comm/comm.h"
+#include "platform_comm/comm_async_workspace.h"
 #include "platform_comm/comm_context.h"
+#include "platform/onboard/host/sdma_workspace_provider.h"
 
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
@@ -45,9 +47,6 @@
 #include "acl/acl.h"
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-#include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
-#endif
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
 #include "pto/comm/async/urma/urma_workspace_manager.hpp"
 #endif
@@ -103,9 +102,9 @@ struct CommHandle_ {
     bool owns_device_ctx = false;
     std::vector<CommContext *> derived_contexts;
     std::unordered_map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
-#endif
+    // One ref on the per-device SDMA provider, acquired on first domain that
+    // declares SDMA; released in comm_destroy.
+    void *sdma_provider_handle = nullptr;
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
 #endif
@@ -247,6 +246,35 @@ static void release_domain_peer_windows(DomainAllocation &alloc) {
         release_own_vmm_window(pw.first, pw.second);
     }
     alloc.peer_windows.clear();
+}
+
+// Publish a host CommContext to the device as a whole CommContextBlock.
+//
+// Every device context this backend hands out is block-sized so the async
+// workspace trailer is always present, and the copy always covers the trailer:
+// a block-sized allocation whose tail is never written leaves the table's magic
+// reading uninitialised device memory, which can match by accident.
+//
+// The returned pointer is the CommContext prefix at offset 0, so callers store,
+// hand out and aclrtFree it exactly as they did the bare context before.
+static CommContext *
+publish_device_context(const CommContext &ctx, const CommAsyncWorkspaceTable &async, int rank, const char *site) {
+    void *device_mem = nullptr;
+    aclError status = aclrtMalloc(&device_mem, sizeof(CommContextBlock), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[comm rank %d] %s: ctx aclrtMalloc -> %d", rank, site, static_cast<int>(status));
+        return nullptr;
+    }
+    CommContextBlock block{};
+    block.ctx = ctx;
+    block.async = async;
+    status = aclrtMemcpy(device_mem, sizeof(block), &block, sizeof(block), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[comm rank %d] %s: ctx Memcpy H2D -> %d", rank, site, static_cast<int>(status));
+        aclrtFree(device_mem);
+        return nullptr;
+    }
+    return static_cast<CommContext *>(device_mem);
 }
 
 }  // namespace
@@ -724,46 +752,42 @@ static std::string domain_barrier_tag(uint64_t allocation_id, const char *phase)
     return std::string("alloc_") + std::to_string(allocation_id) + "_" + phase;
 }
 
-// Idempotently provision the process-global PTO-ISA async-SDMA scratch
-// workspace on the comm handle and mirror its address into host_ctx.  Both
-// the base-window path and the dynamic per-domain path call this; only the
-// first call allocates.  Requires CANN to expose working
-// aclnnShmemSdmaStarsQuery primitives.
-static void ensure_sdma_workspace(CommHandle h) {
+extern "C" uint32_t comm_abi_version(void) { return COMM_ABI_VERSION; }
+
+extern "C" uint32_t dma_workspace_supported_mask(void) {
+    uint32_t mask = 0;
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    if (h->sdma_workspace) return;
-    h->sdma_workspace = std::make_unique<pto::comm::sdma::SdmaWorkspaceManager>();
-    if (h->sdma_workspace->Init()) {
-        h->host_ctx.workSpace = reinterpret_cast<uint64_t>(h->sdma_workspace->GetWorkspaceAddr());
-        h->host_ctx.workSpaceSize = 16 * 1024;
-    } else {
-        // SDMA workspace initialization failed - this may occur due to:
-        // 1. Missing ACL symbols in libopapi.so (CANN version compatibility)
-        // 2. Device state issues (e.g., Critical health status)
-        // 3. Resource exhaustion from repeated test runs
-        // The system gracefully degrades to non-SDMA mode when this occurs.
-        h->sdma_workspace.reset();
-    }
-#else
-    (void)h;
+    mask |= uint32_t{1} << DMA_WORKSPACE_SDMA;
 #endif
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    mask |= uint32_t{1} << DMA_WORKSPACE_URMA;
+#endif
+    return mask;
 }
 
-// Callable-declared workspace injection is not available on a5 yet. Its URMA
-// workspace is sized per communication domain (rank count), not per device;
-// reject required masks before a callable runs instead of silently launching
-// it with a null workspace.
-extern "C" uint32_t dma_workspace_supported_mask(void) { return 0; }
-
 extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
+    // URMA is sized per communication domain and cannot be provisioned here.
     if (!addr_out || !handle_out || count < 0) return -1;
     *handle_out = nullptr;
     for (int i = 0; i < count; ++i)
         addr_out[i] = 0;
+    const uint32_t supported = dma_workspace_supported_mask() & (uint32_t{1} << DMA_WORKSPACE_SDMA);
+    if ((required_mask & ~supported) != 0) return -1;
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    if ((required_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) == 0) return 0;
+    if (count <= DMA_WORKSPACE_SDMA) return -1;
+    uint64_t addr = 0;
+    uint64_t size = 0;
+    if (sdma_workspace_provider_acquire(&addr, &size, handle_out) != 0) return -1;
+    (void)size;
+    addr_out[DMA_WORKSPACE_SDMA] = addr;
+    return 0;
+#else
     return required_mask == 0 ? 0 : -1;
+#endif
 }
 
-extern "C" void dma_workspace_release(void *handle) { (void)handle; }
+extern "C" void dma_workspace_release(void *handle) { sdma_workspace_provider_release(handle); }
 
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
 static uint64_t urma_workspace_bytes(uint32_t rank_count) {
@@ -804,21 +828,69 @@ static bool init_urma_workspace(
     return true;
 }
 
-static bool ensure_base_urma_workspace(CommHandle h) {
-    if (h == nullptr) return false;
-    if (h->urma_workspace) return h->host_ctx.workSpace != 0 && h->host_ctx.workSpaceSize != 0;
-    void *local_buf = reinterpret_cast<void *>(static_cast<uintptr_t>(h->host_ctx.windowsIn[h->rank]));
-    if (!init_urma_workspace(
-            h, static_cast<uint32_t>(h->rank), static_cast<uint32_t>(h->nranks), local_buf, h->host_ctx.winSize,
-            h->urma_workspace
-        )) {
-        return false;
-    }
-    h->host_ctx.workSpace = reinterpret_cast<uint64_t>(h->urma_workspace->GetWorkspaceAddr());
-    h->host_ctx.workSpaceSize = urma_workspace_bytes(static_cast<uint32_t>(h->nranks));
-    return h->host_ctx.workSpace != 0 && h->host_ctx.workSpaceSize != 0;
-}
 #endif
+
+// Fill the per-domain async trailer from engine_mask. SDMA shares the
+// per-device provider; URMA is created per DomainAllocation. Hard-fails when
+// a declared engine is unsupported, SDMA init fails, or URMA ranks are not a
+// dense prefix of the base communicator.
+static int fill_domain_async_table(
+    CommHandle h, uint32_t engine_mask, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    void *local_buf, uint64_t win_size, DomainAllocation *alloc, CommAsyncWorkspaceTable *table_out
+) {
+    if (h == nullptr || alloc == nullptr || table_out == nullptr) return -1;
+    *table_out = make_empty_comm_async_table();
+    const uint32_t supported = dma_workspace_supported_mask();
+    if ((engine_mask & ~supported) != 0) {
+        LOG_ERROR(
+            "[comm rank %d] alloc_domain: engine_mask=0x%x not subset of supported=0x%x", h->rank, engine_mask,
+            supported
+        );
+        return -1;
+    }
+
+    if ((engine_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) != 0) {
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+        if (sdma_workspace_provider_bind(
+                &h->sdma_provider_handle, &table_out->addr[DMA_WORKSPACE_SDMA], &table_out->size[DMA_WORKSPACE_SDMA]
+            ) != 0) {
+            LOG_ERROR("[comm rank %d] alloc_domain: SDMA provider bind failed", h->rank);
+            return -1;
+        }
+#else
+        (void)local_buf;
+        (void)win_size;
+        return -1;
+#endif
+    }
+
+    if ((engine_mask & (uint32_t{1} << DMA_WORKSPACE_URMA)) != 0) {
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+        if (!rank_ids_are_dense_prefix(rank_ids, rank_count)) {
+            LOG_ERROR("[comm rank %d] alloc_domain: URMA requires dense-prefix rank_ids (rank_ids[i]==i)", h->rank);
+            return -1;
+        }
+        if (!init_urma_workspace(
+                h, domain_rank, static_cast<uint32_t>(rank_count), local_buf, win_size, alloc->urma_workspace
+            )) {
+            LOG_ERROR("[comm rank %d] alloc_domain: URMA workspace init failed", h->rank);
+            return -1;
+        }
+        table_out->addr[DMA_WORKSPACE_URMA] = reinterpret_cast<uint64_t>(alloc->urma_workspace->GetWorkspaceAddr());
+        table_out->size[DMA_WORKSPACE_URMA] = urma_workspace_bytes(static_cast<uint32_t>(rank_count));
+        if (table_out->addr[DMA_WORKSPACE_URMA] == 0) {
+            alloc->urma_workspace.reset();
+            return -1;
+        }
+#else
+        (void)rank_ids;
+        (void)rank_count;
+        (void)domain_rank;
+        return -1;
+#endif
+    }
+    return 0;
+}
 
 static void reset_domain_urma_workspace(DomainAllocation &alloc) {
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
@@ -846,7 +918,7 @@ static void reset_base_urma_workspace(CommHandle h) {
 // the peer imports live on `out->peer_windows` for comm_release_domain_windows.
 static int domain_alloc_via_ipc(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    uint64_t win_size, DomainAllocation *out
+    uint64_t win_size, uint32_t engine_mask, DomainAllocation *out
 ) {
     const std::string &rootinfo = h->rootinfo_path;
     const uint64_t run_token = h->run_token;
@@ -1013,45 +1085,26 @@ static int domain_alloc_via_ipc(
     out->nranks = subset_n;
     out->local_buf = localBuf;
     out->own_handle = handle;
-    // Build a host-side CommContext for the subset and upload it as device_ctx.
-    // PTO-ISA async SDMA ops (SdmaTget) read the scratch workspace off
-    // CommContext::workSpace.  The dynamic-domain path does not go through
-    // comm_alloc_windows, so provision the workspace here; without it a
-    // freshly zero-initialized per-domain ctx would leave workSpace == 0 and
-    // those kernels early-return on the workSpace guard.
-    ensure_sdma_workspace(h);
 
-    uint64_t domain_workspace_addr = 0;
-    uint64_t domain_workspace_size = 0;
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    if (h->sdma_workspace) {
-        domain_workspace_addr = reinterpret_cast<uint64_t>(h->sdma_workspace->GetWorkspaceAddr());
-        domain_workspace_size = 16 * 1024;
+    CommAsyncWorkspaceTable async_table{};
+    if (fill_domain_async_table(
+            h, engine_mask, rank_ids, rank_count, domain_rank, localBuf, aligned_size, out, &async_table
+        ) != 0) {
+        reset_domain_urma_workspace(*out);
+        release_domain_peer_windows(*out);
+        release_own_vmm_window(localBuf, handle);
+        return -1;
     }
-#endif
-#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
-    if (rank_ids_are_dense_prefix(rank_ids, rank_count)) {
-        if (!init_urma_workspace(
-                h, domain_rank, static_cast<uint32_t>(rank_count), localBuf, aligned_size, out->urma_workspace
-            )) {
-            reset_domain_urma_workspace(*out);
-            release_domain_peer_windows(*out);
-            release_own_vmm_window(localBuf, handle);
-            return -1;
-        }
-        domain_workspace_addr = reinterpret_cast<uint64_t>(out->urma_workspace->GetWorkspaceAddr());
-        domain_workspace_size = urma_workspace_bytes(static_cast<uint32_t>(rank_count));
-    } else {
-        LOG_WARN("[comm rank %d] alloc_domain: URMA workspace disabled for non-dense rank mapping", h->rank);
-    }
-#endif
 
     CommContext ctx{};
     ctx.rankId = domain_rank;
     ctx.rankNum = static_cast<uint32_t>(subset_n);
     ctx.winSize = aligned_size;
-    ctx.workSpace = domain_workspace_addr;
-    ctx.workSpaceSize = domain_workspace_size;
+    // Async engines live in the CommContextBlock trailer; the mirrored
+    // workSpace pair stays zero so pto-isa and legacy single-slot readers
+    // cannot confuse SDMA with URMA.
+    ctx.workSpace = 0;
+    ctx.workSpaceSize = 0;
     ctx.windowsIn[my_dr] = reinterpret_cast<uint64_t>(localBuf);
     // Import each peer's shareable handle onto our device; see the symmetry
     // note in alloc_windows_via_ipc (one win_size, shared chip granularity).
@@ -1109,25 +1162,14 @@ static int domain_alloc_via_ipc(
         ctx.windowsIn[p] = reinterpret_cast<uint64_t>(peerVa);
     }
 
-    void *newDevMem = nullptr;
-    aret = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
+    CommContext *device_ctx = publish_device_context(ctx, async_table, h->rank, "alloc_domain");
+    if (device_ctx == nullptr) {
         reset_domain_urma_workspace(*out);
         release_domain_peer_windows(*out);
         release_own_vmm_window(localBuf, handle);
         return -1;
     }
-    aret = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
-        aclrtFree(newDevMem);
-        reset_domain_urma_workspace(*out);
-        release_domain_peer_windows(*out);
-        release_own_vmm_window(localBuf, handle);
-        return -1;
-    }
-    out->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
+    out->device_ctx = device_ctx;
     return 0;
 }
 
@@ -1153,23 +1195,15 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *devic
     const uint64_t effective_win_size = win_size != 0 ? static_cast<uint64_t>(win_size) : kDefaultIpcWinSize;
     if (alloc_windows_via_ipc(h, effective_win_size) != 0) return -1;
 
-    // Optional PTO-ISA async SDMA workspace pre-allocation (overlays the comm
-    // backend's output; comm-side flow does not care about workSpace).
-    ensure_sdma_workspace(h);
-#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
-    if (!ensure_base_urma_workspace(h)) return -1;
-    if (!file_barrier(h->rootinfo_path, h->rank, h->nranks, "base_urma_ready", h->run_token)) return -1;
-#endif
+    // Async engines are declared per domain (engine_mask), not on the base
+    // communicator. Keep the mirrored workSpace pair empty.
+    h->host_ctx.workSpace = 0;
+    h->host_ctx.workSpaceSize = 0;
 
-    void *newDevMem = nullptr;
-    aclError aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (aRet != ACL_SUCCESS) return -1;
-    aRet = aclrtMemcpy(newDevMem, sizeof(CommContext), &h->host_ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (aRet != ACL_SUCCESS) {
-        aclrtFree(newDevMem);
-        return -1;
-    }
-    h->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
+    CommContext *device_ctx =
+        publish_device_context(h->host_ctx, make_empty_comm_async_table(), h->rank, "comm_alloc_windows");
+    if (device_ctx == nullptr) return -1;
+    h->device_ctx = device_ctx;
     h->owns_device_ctx = true;
     *device_ctx_out = reinterpret_cast<uint64_t>(h->device_ctx);
     return 0;
@@ -1218,8 +1252,8 @@ extern "C" int comm_derive_context(
     }
 
     CommContext ctx{};
-    ctx.workSpace = h->host_ctx.workSpace;
-    ctx.workSpaceSize = h->host_ctx.workSpaceSize;
+    ctx.workSpace = 0;
+    ctx.workSpaceSize = 0;
     ctx.rankId = domain_rank;
     ctx.rankNum = static_cast<uint32_t>(rank_count);
     ctx.winSize = window_size;
@@ -1236,20 +1270,8 @@ extern "C" int comm_derive_context(
         ctx.windowsOut[i] = h->host_ctx.windowsOut[base_rank] + window_offset;
     }
 
-    void *newDevMem = nullptr;
-    aclError aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (aRet != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] comm_derive_context: aclrtMalloc failed: %d", h->rank, static_cast<int>(aRet));
-        return -1;
-    }
-    aRet = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (aRet != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] comm_derive_context: aclrtMemcpy H2D failed: %d", h->rank, static_cast<int>(aRet));
-        aclrtFree(newDevMem);
-        return -1;
-    }
-
-    auto *derived = reinterpret_cast<CommContext *>(newDevMem);
+    CommContext *derived = publish_device_context(ctx, make_empty_comm_async_table(), h->rank, "comm_derive_context");
+    if (derived == nullptr) return -1;
     h->derived_contexts.push_back(derived);
     *device_ctx_out = reinterpret_cast<uint64_t>(derived);
     return 0;
@@ -1277,7 +1299,7 @@ extern "C" int comm_barrier(CommHandle h) {
 
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint32_t engine_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out
 ) try {
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
@@ -1311,7 +1333,9 @@ extern "C" int comm_alloc_domain_windows(
     }
 
     auto alloc = std::make_unique<DomainAllocation>();
-    int rc = domain_alloc_via_ipc(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get());
+    int rc = domain_alloc_via_ipc(
+        h, allocation_id, rank_ids, rank_count, domain_rank, window_size, engine_mask, alloc.get()
+    );
     if (rc != 0) return rc;
 
     *device_ctx_out = reinterpret_cast<uint64_t>(alloc->device_ctx);
@@ -1435,6 +1459,10 @@ extern "C" int comm_destroy(CommHandle h) try {
     }
     h->domain_allocations.clear();
     reset_base_urma_workspace(h);
+    if (h->sdma_provider_handle != nullptr) {
+        sdma_workspace_provider_release(h->sdma_provider_handle);
+        h->sdma_provider_handle = nullptr;
+    }
     if (h->hccl_comm) {
         HcclResult hret = hccl_comm_destroy(h->hccl_comm);
         if (hret != HCCL_SUCCESS) {

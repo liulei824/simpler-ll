@@ -489,6 +489,7 @@ class Orchestrator:
         workers: Sequence[int],
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
+        engines: Sequence[str] = (),
     ) -> CommDomainHandle:
         """Collectively allocate a fresh CommDomain across `workers`.
 
@@ -508,6 +509,11 @@ class Orchestrator:
         chip-side allocation is dispatched, so an oversized request raises
         ``ValueError`` here without leaking a backend allocation.
 
+        ``engines`` names the async-DMA engines this domain will use
+        (``"sdma"``, ``"urma"``). Declaration is explicit: the default empty
+        sequence provisions none. Declaring an engine the platform/build does
+        not support hard-fails at allocation time.
+
         Use the handle as a context manager for auto-release:
 
             with orch.allocate_domain(name="tp", workers=[0, 1], window_size=4096) as tp:
@@ -525,6 +531,7 @@ class Orchestrator:
                 workers=tuple(int(w) for w in workers),
                 window_size=int(window_size),
                 buffers=list(buffers),
+                engines=tuple(str(e) for e in engines),
             )
 
     def release_domain(self, handle: CommDomainHandle) -> None:

@@ -45,21 +45,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 N = 128 * 128
 DTYPE_NBYTES = 4
 URMA_DATA_OFFSET_NBYTES = 64 * 4
-_URMA_WORKSPACE_ENV = "SIMPLER_ENABLE_PTO_URMA_WORKSPACE"
-_WORKSPACE_TRUTHY = {"1", "ON", "TRUE", "YES"}
-
-
-def _urma_workspace_enabled() -> bool:
-    return os.environ.get(_URMA_WORKSPACE_ENV, "").upper() in _WORKSPACE_TRUTHY
-
-
-def _require_urma_workspace_enabled() -> None:
-    if _urma_workspace_enabled():
-        return
-    raise RuntimeError(
-        "urma_deferred_completion_demo requires host runtime built with "
-        f"{_URMA_WORKSPACE_ENV}=ON; set it before rebuilding simpler."
-    )
 
 
 def parse_device_range(spec: str) -> list[int]:
@@ -116,7 +101,6 @@ def build_chip_callable(platform: str) -> ChipCallable:
 
 
 def run(platform: str = "a5", device_ids: list[int] | None = None) -> int:
-    _require_urma_workspace_enabled()
     if device_ids is None:
         device_ids = [0, 1]
     nranks = len(device_ids)
@@ -174,6 +158,7 @@ def run(platform: str = "a5", device_ids: list[int] | None = None) -> int:
                     ),
                     CommBufferSpec(name="input_window", dtype="float32", count=N, nbytes=input_nbytes),
                 ],
+                engines=("urma",),
             ) as handle:
                 # Stage every rank's input window before submitting any kernel:
                 # each producer TGET_ASYNCs the *peer* rank's window, so all
@@ -209,11 +194,6 @@ def run(platform: str = "a5", device_ids: list[int] | None = None) -> int:
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
-@pytest.mark.skipif(
-    not _urma_workspace_enabled(),
-    reason="URMA workspace backend not enabled (set "
-    "SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON before rebuilding and when running pytest).",
-)
 def test_urma_deferred_completion_demo(st_device_ids, st_platform) -> None:
     assert run(st_platform, [int(d) for d in st_device_ids]) == 0
 

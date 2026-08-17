@@ -411,6 +411,18 @@ target_link_libraries(test_run_stream_slots PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LI
 add_test(NAME test_run_stream_slots COMMAND test_run_stream_slots)
 set_tests_properties(test_run_stream_slots PROPERTIES LABELS "no_hardware")
 
+# CommContext's async-workspace trailer. Header-only: no runtime objects, no
+# ACL, so the layout static_asserts run on the no-hardware CI job too.
+add_executable(test_comm_context_block common/test_comm_context_block.cpp)
+target_include_directories(test_comm_context_block PRIVATE
+    ${GTEST_INCLUDE_DIRS}
+    ${CMAKE_SOURCE_DIR}/../../../src/common
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/include
+)
+target_link_libraries(test_comm_context_block PRIVATE ${GTEST_MAIN_LIB} ${GTEST_LIB} pthread)
+add_test(NAME test_comm_context_block COMMAND test_comm_context_block)
+set_tests_properties(test_comm_context_block PROPERTIES LABELS "no_hardware")
+
 add_executable(test_native_run_execution common/test_native_run_execution.cpp)
 target_include_directories(test_native_run_execution PRIVATE
     ${GTEST_INCLUDE_DIRS}

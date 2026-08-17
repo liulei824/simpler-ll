@@ -21,8 +21,10 @@
  */
 
 #include "platform_comm/comm.h"
+#include "platform_comm/comm_async_workspace.h"
 #include "platform_comm/comm_context.h"
 #include "pto_runtime_c_api.h"
+#include "platform/onboard/host/sdma_workspace_provider.h"
 
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
@@ -47,7 +49,6 @@
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-#include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
 #endif
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
@@ -112,6 +113,10 @@ struct CommHandle_ {
     std::vector<VmmWindow> base_peer_windows;
     std::vector<CommContext *> derived_contexts;
     std::unordered_map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
+    // One ref on the per-device SDMA provider, taken by the first domain that
+    // declares SDMA and released in comm_destroy. Independent of the ref the
+    // Worker-init dma_workspace_provision path holds.
+    void *sdma_provider_handle = nullptr;
 };
 
 // ============================================================================
@@ -373,6 +378,35 @@ static aclError release_base_windows(CommHandle h) {
     h->host_ctx.workSpace = workspace;
     h->host_ctx.workSpaceSize = workspace_size;
     return first_error;
+}
+
+// Publish a host CommContext to the device as a whole CommContextBlock.
+//
+// Every device context this backend hands out is block-sized so the async
+// workspace trailer is always present, and the copy always covers the trailer:
+// a block-sized allocation whose tail is never written leaves the table's magic
+// reading uninitialised device memory, which can match by accident.
+//
+// The returned pointer is the CommContext prefix at offset 0, so callers store,
+// hand out and aclrtFree it exactly as they did the bare context before.
+static CommContext *
+publish_device_context(const CommContext &ctx, const CommAsyncWorkspaceTable &async, int rank, const char *site) {
+    void *device_mem = nullptr;
+    aclError status = aclrtMalloc(&device_mem, sizeof(CommContextBlock), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[comm rank %d] %s: ctx aclrtMalloc -> %d", rank, site, static_cast<int>(status));
+        return nullptr;
+    }
+    CommContextBlock block{};
+    block.ctx = ctx;
+    block.async = async;
+    status = aclrtMemcpy(device_mem, sizeof(block), &block, sizeof(block), ACL_MEMCPY_HOST_TO_DEVICE);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[comm rank %d] %s: ctx Memcpy H2D -> %d", rank, site, static_cast<int>(status));
+        aclrtFree(device_mem);
+        return nullptr;
+    }
+    return static_cast<CommContext *>(device_mem);
 }
 
 }  // namespace
@@ -956,7 +990,7 @@ static std::string domain_ipc_announce_path(
 
 static int domain_alloc_via_ipc(
     CommHandle h, uint64_t allocation_id, const uint32_t *, size_t rank_count, uint32_t domain_rank, uint64_t win_size,
-    DomainAllocation *out
+    const CommAsyncWorkspaceTable &async, DomainAllocation *out
 ) {
     const int subset_n = static_cast<int>(rank_count);
     const int local_rank = static_cast<int>(domain_rank);
@@ -1049,34 +1083,18 @@ static int domain_alloc_via_ipc(
         peer_windows.push_back(std::move(peer_window));
     }
 
-    void *new_dev_mem = nullptr;
-    status = aclrtMalloc(&new_dev_mem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (status != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain ipc: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(status));
-        return -1;
-    }
-    status = aclrtMemcpy(new_dev_mem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (status != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain ipc: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(status));
-        aclrtFree(new_dev_mem);
-        return -1;
-    }
+    CommContext *device_ctx = publish_device_context(ctx, async, h->rank, "alloc_domain ipc");
+    if (device_ctx == nullptr) return -1;
 
     out->rank = local_rank;
     out->nranks = subset_n;
     out->local_window = std::move(local_window);
     out->peer_windows = std::move(peer_windows);
-    out->device_ctx = reinterpret_cast<CommContext *>(new_dev_mem);
+    out->device_ctx = device_ctx;
     return 0;
 }
 
-// Host wrapper owning one SDMA-enabled Worker's provisioned resources. The
-// opaque handle returned to the runner IS this manager; dma_workspace_release()
-// destroys it. There is no per-device generation gate: an SDMA-enabled Worker
-// owns its provider for its whole life and releases it at finalize.
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-using SdmaManager = pto::comm::sdma::SdmaWorkspaceManager;
-#endif
+extern "C" uint32_t comm_abi_version(void) { return COMM_ABI_VERSION; }
 
 extern "C" uint32_t dma_workspace_supported_mask(void) {
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
@@ -1096,51 +1114,83 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     if ((required_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) == 0) return 0;
     if (count <= DMA_WORKSPACE_SDMA) return -1;
-    try {
-        auto manager = std::make_unique<SdmaManager>();
-        bool init_ok = false;
-        try {
-            // Init creates the 48 STARS streams + 16KB workspace. It may fail
-            // after creating only a subset; destructing that partial manager on
-            // an error-state card can itself stall, so leak it on failure rather
-            // than risk the stall.
-            init_ok = manager->Init();
-        } catch (...) {
-            LOG_ERROR("SdmaWorkspaceManager::Init threw; abandoning its partial resources");
-        }
-        if (!init_ok) {
-            (void)manager.release();
-            return -1;
-        }
-        const uint64_t addr = reinterpret_cast<uint64_t>(manager->GetWorkspaceAddr());
-        if (addr == 0) {
-            (void)manager.release();
-            LOG_ERROR("dma_workspace_provision: manager returned a null workspace address");
-            return -1;
-        }
-        addr_out[DMA_WORKSPACE_SDMA] = addr;
-        *handle_out = manager.release();
-        return 0;
-    } catch (...) {
-        LOG_ERROR("dma_workspace_provision: exception while provisioning SDMA");
-        return -1;
-    }
+    uint64_t addr = 0;
+    uint64_t size = 0;
+    if (sdma_workspace_provider_acquire(&addr, &size, handle_out) != 0) return -1;
+    (void)size;
+    addr_out[DMA_WORKSPACE_SDMA] = addr;
+    return 0;
 #else
     return required_mask == 0 ? 0 : -1;
 #endif
 }
 
-extern "C" void dma_workspace_release(void *handle) {
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    if (!handle) return;
-    try {
-        std::unique_ptr<SdmaManager> manager(static_cast<SdmaManager *>(handle));
-        manager.reset();
-    } catch (...) {
-        LOG_ERROR("dma_workspace_release: exception while releasing SDMA resources");
+extern "C" void dma_workspace_release(void *handle) { sdma_workspace_provider_release(handle); }
+
+// Reject a domain-allocation request before any device resource is touched.
+static int check_domain_alloc_args(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size
+) {
+    if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
+        LOG_ERROR(
+            "[comm rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)", h->rank,
+            rank_count, domain_rank, window_size
+        );
+        return -1;
     }
+    if (h->domain_allocations.count(allocation_id) > 0) {
+        LOG_ERROR(
+            "[comm rank %d] alloc_domain: allocation_id=%llu already live", h->rank,
+            static_cast<unsigned long long>(allocation_id)
+        );
+        return -1;
+    }
+    if (rank_ids[domain_rank] != static_cast<uint32_t>(h->rank)) {
+        LOG_ERROR(
+            "[comm rank %d] alloc_domain: rank_ids[%u]=%u does not match base rank", h->rank, domain_rank,
+            rank_ids[domain_rank]
+        );
+        return -1;
+    }
+    // The base communicator only needs comm_init to have run (rootinfo_path
+    // + run_token are set, used to scope barrier filenames).  We do NOT
+    // require comm_alloc_windows on the base in the orch-only model — the
+    // dynamic alloc path creates its own per-allocation VMM window.
+    if (h->rootinfo_path.empty() || h->hccl_comm == nullptr) {
+        LOG_ERROR("[comm rank %d] alloc_domain: base communicator not initialised", h->rank);
+        return -1;
+    }
+    return 0;
+}
+
+// Fill the per-domain async trailer from engine_mask. a2a3 supports SDMA only,
+// and its workspace is the shared per-device provider, so nothing here depends
+// on the domain's window -- the table can be built before any window exists.
+// A declared engine the platform does not support is a hard failure, as is a
+// provider that will not come up: engines= is a request, not a hint.
+static int fill_domain_async_table(CommHandle h, uint32_t engine_mask, CommAsyncWorkspaceTable *table_out) {
+    if (h == nullptr || table_out == nullptr) return -1;
+    *table_out = make_empty_comm_async_table();
+    const uint32_t supported = dma_workspace_supported_mask();
+    if ((engine_mask & ~supported) != 0) {
+        LOG_ERROR(
+            "[comm rank %d] alloc_domain: engine_mask=0x%x not subset of supported=0x%x", h->rank, engine_mask,
+            supported
+        );
+        return -1;
+    }
+    if ((engine_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) == 0) return 0;
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    if (sdma_workspace_provider_bind(
+            &h->sdma_provider_handle, &table_out->addr[DMA_WORKSPACE_SDMA], &table_out->size[DMA_WORKSPACE_SDMA]
+        ) != 0) {
+        LOG_ERROR("[comm rank %d] alloc_domain: SDMA provider bind failed", h->rank);
+        return -1;
+    }
+    return 0;
 #else
-    (void)handle;
+    return -1;
 #endif
 }
 
@@ -1154,7 +1204,7 @@ extern "C" void dma_workspace_release(void *handle) {
 // the peer imports live on `out->peer_windows` for comm_release_domain_windows.
 static FabricAttempt domain_alloc_via_fabric(
     CommHandle h, uint64_t allocation_id, const uint32_t *, size_t rank_count, uint32_t domain_rank, uint64_t win_size,
-    DomainAllocation *out
+    const CommAsyncWorkspaceTable &async, DomainAllocation *out
 ) {
     const std::string &rootinfo = h->rootinfo_path;
     const uint64_t run_token = h->run_token;
@@ -1233,9 +1283,8 @@ static FabricAttempt domain_alloc_via_fabric(
 
     out->rank = my_dr;
     out->nranks = subset_n;
-    // Build a host-side CommContext for the subset and upload it as device_ctx.
-    // Async-engine workspaces are runtime-owned and injected through each
-    // kernel's GlobalContext, independent of this communication domain.
+    // Build a host-side CommContext for the subset and upload it as device_ctx,
+    // carrying the async table this domain declared through engine_mask.
     CommContext ctx{};
     ctx.rankId = domain_rank;
     ctx.rankNum = static_cast<uint32_t>(subset_n);
@@ -1256,21 +1305,12 @@ static FabricAttempt domain_alloc_via_fabric(
         out->peer_windows.push_back(std::move(peer_window));
     }
 
-    void *newDevMem = nullptr;
-    aret = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
+    CommContext *device_ctx = publish_device_context(ctx, async, h->rank, "alloc_domain");
+    if (device_ctx == nullptr) {
         release_domain_windows(out);
         return FabricAttempt::kError;
     }
-    aret = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (aret != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
-        aclrtFree(newDevMem);
-        release_domain_windows(out);
-        return FabricAttempt::kError;
-    }
-    out->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
+    out->device_ctx = device_ctx;
     return FabricAttempt::kSuccess;
 }
 
@@ -1293,21 +1333,14 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *devic
         if (alloc_windows_via_ipc(h, effective_win_size) != 0) return -1;
     }
 
-    void *newDevMem = nullptr;
-    aclError aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (aRet != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] comm_alloc_windows: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(aRet));
+    // The base communicator declares no async engines: those are per-domain.
+    CommContext *device_ctx =
+        publish_device_context(h->host_ctx, make_empty_comm_async_table(), h->rank, "comm_alloc_windows");
+    if (device_ctx == nullptr) {
         release_base_windows(h);
         return -1;
     }
-    aRet = aclrtMemcpy(newDevMem, sizeof(CommContext), &h->host_ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (aRet != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] comm_alloc_windows: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aRet));
-        aclrtFree(newDevMem);
-        release_base_windows(h);
-        return -1;
-    }
-    h->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
+    h->device_ctx = device_ctx;
     h->owns_device_ctx = true;
     *device_ctx_out = reinterpret_cast<uint64_t>(h->device_ctx);
     return 0;
@@ -1374,20 +1407,8 @@ extern "C" int comm_derive_context(
         ctx.windowsOut[i] = h->host_ctx.windowsOut[base_rank] + window_offset;
     }
 
-    void *newDevMem = nullptr;
-    aclError aRet = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (aRet != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] comm_derive_context: aclrtMalloc failed: %d", h->rank, static_cast<int>(aRet));
-        return -1;
-    }
-    aRet = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (aRet != ACL_SUCCESS) {
-        LOG_ERROR("[comm rank %d] comm_derive_context: aclrtMemcpy H2D failed: %d", h->rank, static_cast<int>(aRet));
-        aclrtFree(newDevMem);
-        return -1;
-    }
-
-    auto *derived = reinterpret_cast<CommContext *>(newDevMem);
+    CommContext *derived = publish_device_context(ctx, make_empty_comm_async_table(), h->rank, "comm_derive_context");
+    if (derived == nullptr) return -1;
     h->derived_contexts.push_back(derived);
     *device_ctx_out = reinterpret_cast<uint64_t>(derived);
     return 0;
@@ -1415,47 +1436,25 @@ extern "C" int comm_barrier(CommHandle h) {
 
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint32_t engine_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out
 ) try {
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out) return -1;
-    if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
-        LOG_ERROR(
-            "[comm rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)", h->rank,
-            rank_count, domain_rank, window_size
-        );
-        return -1;
-    }
-    if (h->domain_allocations.count(allocation_id) > 0) {
-        LOG_ERROR(
-            "[comm rank %d] alloc_domain: allocation_id=%llu already live", h->rank,
-            static_cast<unsigned long long>(allocation_id)
-        );
-        return -1;
-    }
-    if (rank_ids[domain_rank] != static_cast<uint32_t>(h->rank)) {
-        LOG_ERROR(
-            "[comm rank %d] alloc_domain: rank_ids[%u]=%u does not match base rank", h->rank, domain_rank,
-            rank_ids[domain_rank]
-        );
-        return -1;
-    }
-    // The base communicator only needs comm_init to have run (rootinfo_path
-    // + run_token are set, used to scope barrier filenames).  We do NOT
-    // require comm_alloc_windows on the base in the orch-only model — the
-    // dynamic alloc path creates its own per-allocation VMM window.
-    if (h->rootinfo_path.empty() || h->hccl_comm == nullptr) {
-        LOG_ERROR("[comm rank %d] alloc_domain: base communicator not initialised", h->rank);
-        return -1;
-    }
+    if (check_domain_alloc_args(h, allocation_id, rank_ids, rank_count, domain_rank, window_size) != 0) return -1;
+
+    // Built before any window exists: a2a3's only engine is SDMA, whose
+    // workspace is the shared per-device provider and knows nothing about this
+    // domain. Failing here costs nothing to unwind.
+    CommAsyncWorkspaceTable async{};
+    if (fill_domain_async_table(h, engine_mask, &async) != 0) return -1;
 
     auto alloc = std::make_unique<DomainAllocation>();
     const FabricAttempt fabric_result =
-        domain_alloc_via_fabric(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get());
+        domain_alloc_via_fabric(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, async, alloc.get());
     if (fabric_result == FabricAttempt::kError) return -1;
     if (fabric_result == FabricAttempt::kUnsupported) {
         LOG_INFO("[comm rank %d] Fabric V2 unsupported; using VMM IPC domain windows", h->rank);
         const int rc =
-            domain_alloc_via_ipc(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get());
+            domain_alloc_via_ipc(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, async, alloc.get());
         if (rc != 0) return rc;
     }
 
@@ -1645,18 +1644,11 @@ extern "C" int comm_global_domain_import(
         ctx.windowsOut[rank] = window_addr;
     }
 
-    void *device_ctx = nullptr;
-    aclError status = aclrtMalloc(&device_ctx, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
-    if (status != ACL_SUCCESS) {
-        return -1;
-    }
-    status = aclrtMemcpy(device_ctx, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
-    if (status != ACL_SUCCESS) {
-        aclrtFree(device_ctx);
-        return -1;
-    }
+    CommContext *device_ctx =
+        publish_device_context(ctx, make_empty_comm_async_table(), allocation->rank, "global_domain_import");
+    if (device_ctx == nullptr) return -1;
     allocation->peer_windows = std::move(peer_windows);
-    allocation->device_ctx = static_cast<CommContext *>(device_ctx);
+    allocation->device_ctx = device_ctx;
     *device_ctx_out = reinterpret_cast<uint64_t>(device_ctx);
     return 0;
 } catch (const std::exception &e) {
@@ -1748,6 +1740,10 @@ extern "C" int comm_destroy(CommHandle h) try {
         if (release_domain_windows(alloc.get()) != ACL_SUCCESS && rc == 0) rc = -1;
     }
     h->domain_allocations.clear();
+    if (h->sdma_provider_handle != nullptr) {
+        sdma_workspace_provider_release(h->sdma_provider_handle);
+        h->sdma_provider_handle = nullptr;
+    }
     if (release_base_windows(h) != ACL_SUCCESS && rc == 0) rc = -1;
     if (h->hccl_comm) {
         HcclResult hret = hccl_comm_destroy(h->hccl_comm);

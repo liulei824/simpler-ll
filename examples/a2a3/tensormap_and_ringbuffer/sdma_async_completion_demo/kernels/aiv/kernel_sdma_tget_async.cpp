@@ -44,7 +44,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     int rank = static_cast<int>(comm_ctx->rankId);
     int nranks = static_cast<int>(comm_ctx->rankNum);
-    __gm__ uint8_t *sdma_workspace = get_dma_workspace(args, DMA_WORKSPACE_SDMA);
+    __gm__ uint8_t *sdma_workspace = get_comm_dma_workspace(comm_ctx, DMA_WORKSPACE_SDMA);
+    // A null workspace means the domain was not allocated with engines=("sdma",)
+    // or host-side SDMA provisioning failed.
     if (nranks != 2 || sdma_workspace == nullptr) {
         pipe_barrier(PIPE_ALL);
         return;

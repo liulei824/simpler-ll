@@ -15,6 +15,11 @@ AsyncEvent through ``defer_pto_async_event``.  The consumer depends on the
 producer output and writes ``result = out + 1``.  Correct ``out`` and
 ``result`` therefore validate both the SDMA completion polling and the
 deferred-release dependency path.
+
+The SDMA workspace comes from the domain: ``allocate_domain(engines=("sdma",))``
+fills the ``CommContextBlock`` trailer and the kernel reads it through
+``get_comm_dma_workspace``.  No ``enable_sdma`` Worker flag is involved -- that
+one is for the domain-less path (``prefetch_async_demo``).
 """
 
 from __future__ import annotations
@@ -127,7 +132,6 @@ def run(
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=0,
-        enable_sdma=True,
     )
     chip_handle = worker.register(chip_callable)
     input_views: list = []
@@ -154,6 +158,7 @@ def run(
                 buffers=[
                     CommBufferSpec(name="input_window", dtype="float32", count=N, nbytes=input_nbytes),
                 ],
+                engines=("sdma",),
             ) as handle:
                 # Stage every rank's input window before submitting any kernel:
                 # each producer TGET_ASYNCs the *peer* rank's window, so all
