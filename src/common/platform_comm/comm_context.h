@@ -91,11 +91,23 @@ static_assert(offsetof(CommContext, windowsOut) == 544, "CommContext layout drif
 static constexpr uint32_t COMM_ASYNC_WORKSPACE_MAGIC = 0x53414D57u;  // 'SAMW'
 static constexpr uint32_t COMM_ASYNC_WORKSPACE_VERSION = 1u;
 
+// One slot per engine. `rank_count` / `domain_rank` are the domain's properties,
+// not the engine's -- an SDMA workspace does not know which ranks share it, so
+// the domain layer fills them and a kernel holding several domains' contexts
+// reads each engine's numbering from that domain's own slot.
+struct CommEngineSlot {
+    uint64_t addr;  // 0 = this domain did not provision this engine
+    uint64_t size;
+    uint32_t backend;  // engine-private backend id; 0 when the engine has one backend
+    uint32_t rank_count;
+    uint32_t domain_rank;
+    uint32_t reserved;
+};
+
 struct CommAsyncWorkspaceTable {
     uint32_t magic;
     uint32_t version;
-    uint64_t addr[DMA_WORKSPACE_KIND_COUNT];
-    uint64_t size[DMA_WORKSPACE_KIND_COUNT];
+    struct CommEngineSlot slots[DMA_WORKSPACE_KIND_COUNT];
 };
 
 // What the host actually allocates for every device context. The CommContext
@@ -110,26 +122,40 @@ struct CommContextBlock {
 
 static_assert(offsetof(CommContextBlock, ctx) == 0, "CommContextBlock prefix must alias CommContext");
 static_assert(offsetof(CommContextBlock, async) == 1056, "CommContextBlock trailer offset drift");
-static_assert(sizeof(CommContextBlock) == 1096, "CommContextBlock size drift");
+static_assert(sizeof(CommContextBlock) == 1160, "CommContextBlock size drift");
 
-// Device-side accessor for the per-domain async trailer. Available only in
+// The device side indexes slots[] by kind, so a stride change silently reads the
+// wrong engine's bytes rather than failing. Pin the stride, not just the total.
+static_assert(sizeof(CommEngineSlot) == 32, "CommEngineSlot stride drift");
+static_assert(sizeof(CommAsyncWorkspaceTable) == 8 + 32 * DMA_WORKSPACE_KIND_COUNT, "trailer size drift");
+
+// Device-side accessors for the per-domain async trailer. Available only in
 // translation units that define __gm__ (AICore kernels). Host code must not
-// call this — the trailer is filled on the host via CommAsyncWorkspaceTable.
+// call these — the trailer is filled on the host via CommAsyncWorkspaceTable.
 //
-// Recovers the block by casting through the offset-0 CommContext prefix, then
-// checks magic/version so a context published without a trailer (or with a
+// Both recover the block by casting through the offset-0 CommContext prefix,
+// then check magic/version so a context published without a trailer (or with a
 // stale one) yields nullptr instead of a garbage workspace address.
 #ifdef __gm__
 #ifndef __aicore__
 #define __aicore__
 #endif
-static __aicore__ inline __gm__ uint8_t *get_comm_dma_workspace(__gm__ CommContext *ctx, int kind) {
+// A non-null return means the engine is usable: the table is stamped by a
+// matching host and this domain provisioned that engine. Callers then read
+// domain_rank / rank_count off the slot instead of translating rank numbers.
+static __aicore__ inline __gm__ const CommEngineSlot *get_comm_engine_slot(__gm__ CommContext *ctx, int kind) {
     if (ctx == nullptr || kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return nullptr;
     __gm__ CommContextBlock *block = reinterpret_cast<__gm__ CommContextBlock *>(ctx);
     if (block->async.magic != COMM_ASYNC_WORKSPACE_MAGIC || block->async.version != COMM_ASYNC_WORKSPACE_VERSION) {
         return nullptr;
     }
-    uint64_t addr = block->async.addr[kind];
-    return addr == 0 ? nullptr : reinterpret_cast<__gm__ uint8_t *>(addr);
+    __gm__ const CommEngineSlot *slot = &block->async.slots[kind];
+    return slot->addr == 0 ? nullptr : slot;
+}
+
+// Address-only view of the same slot, kept for kernels that need nothing else.
+static __aicore__ inline __gm__ uint8_t *get_comm_dma_workspace(__gm__ CommContext *ctx, int kind) {
+    __gm__ const CommEngineSlot *slot = get_comm_engine_slot(ctx, kind);
+    return slot == nullptr ? nullptr : reinterpret_cast<__gm__ uint8_t *>(slot->addr);
 }
 #endif

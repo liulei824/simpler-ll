@@ -77,6 +77,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/sdma_workspace_provider.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/engine_provider_registry.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})

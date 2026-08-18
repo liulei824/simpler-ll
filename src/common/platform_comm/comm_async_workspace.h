@@ -40,6 +40,27 @@ inline CommAsyncWorkspaceTable make_empty_comm_async_table() {
     return table;
 }
 
+/**
+ * Record one engine's workspace in the table.
+ *
+ * `domain_rank` / `rank_count` describe the domain, not the engine — an SDMA
+ * workspace cannot report them and a per-domain URMA one would only be
+ * repeating what its caller already knows. Funnelling every slot write through
+ * here keeps that split with one writer instead of one per backend.
+ */
+inline void fill_comm_engine_slot(
+    CommAsyncWorkspaceTable &table, int kind, uint64_t addr, uint64_t size, uint32_t backend, uint32_t domain_rank,
+    uint32_t rank_count
+) {
+    if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return;
+    CommEngineSlot &slot = table.slots[kind];
+    slot.addr = addr;
+    slot.size = size;
+    slot.backend = backend;
+    slot.rank_count = rank_count;
+    slot.domain_rank = domain_rank;
+}
+
 /** Pair `ctx` with an empty trailer, ready to be copied to the device as a unit. */
 inline CommContextBlock make_comm_context_block(const CommContext &ctx) {
     CommContextBlock block{};

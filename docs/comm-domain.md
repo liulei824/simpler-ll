@@ -205,7 +205,9 @@ with orch.allocate_domain(name="tp", workers=[0, 1], window_size=..., engines=("
 
 Both onboard backends then fill that engine's slot in the domain's
 `CommContextBlock` trailer, and the kernel reads it with
-`get_comm_dma_workspace(comm_ctx, DMA_WORKSPACE_SDMA)`. Omitting `engines=`
+`get_comm_dma_workspace(comm_ctx, DMA_WORKSPACE_SDMA)` for the address alone or
+`get_comm_engine_slot(comm_ctx, DMA_WORKSPACE_SDMA)` for the whole slot, which
+also carries the size and this domain's `domain_rank` / `rank_count`. Omitting `engines=`
 leaves every slot zero, so a kernel that asks for one gets `nullptr` and
 self-skips. Declaring an engine the platform or build does not offer is a hard
 failure, not a silent downgrade — on a2a3 that includes `"urma"`, and under

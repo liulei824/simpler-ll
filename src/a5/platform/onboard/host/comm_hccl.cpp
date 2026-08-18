@@ -25,6 +25,7 @@
 #include "platform_comm/comm.h"
 #include "platform_comm/comm_async_workspace.h"
 #include "platform_comm/comm_context.h"
+#include "platform/onboard/host/engine_provider_registry.h"
 #include "platform/onboard/host/sdma_workspace_provider.h"
 
 #include "common/unified_log.h"
@@ -789,106 +790,55 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
 
 extern "C" void dma_workspace_release(void *handle) { sdma_workspace_provider_release(handle); }
 
+// Adopt whatever the registry built for this domain. Domain-scope engines hand
+// their object back through EngineInstance::opaque because DomainAllocation is
+// private to this translation unit; once adopted it dies with the domain.
+static void adopt_domain_engine_instances(DomainAllocation *alloc, EngineInstance *instances) {
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
-static uint64_t urma_workspace_bytes(uint32_t rank_count) {
-    using namespace pto::comm::urma;
-    constexpr uint32_t qp_num = 1;
-    return sizeof(UrmaInfo) +
-           static_cast<uint64_t>(rank_count) *
-               (2ULL * sizeof(UrmaWQCtx) * qp_num + 2ULL * sizeof(UrmaCqCtx) * qp_num + sizeof(UrmaMemInfo) * qp_num);
-}
-
-static bool rank_ids_are_dense_prefix(const uint32_t *rank_ids, size_t rank_count) {
-    if (rank_ids == nullptr) return false;
-    for (size_t i = 0; i < rank_count; ++i) {
-        if (rank_ids[i] != static_cast<uint32_t>(i)) return false;
+    EngineInstance &urma = instances[DMA_WORKSPACE_URMA];
+    if (urma.opaque != nullptr) {
+        alloc->urma_workspace.reset(static_cast<pto::comm::urma::UrmaWorkspaceManager *>(urma.opaque));
+        urma.opaque = nullptr;
     }
-    return true;
-}
-
-static bool init_urma_workspace(
-    CommHandle h, uint32_t rank_id, uint32_t rank_count, void *symmetric_addr, uint64_t symmetric_size,
-    std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> &workspace
-) {
-    if (workspace) return workspace->GetWorkspaceAddr() != nullptr;
-    if (h == nullptr || h->hccl_comm == nullptr || symmetric_addr == nullptr || symmetric_size == 0 ||
-        rank_id >= rank_count) {
-        return false;
-    }
-
-    auto manager = std::make_unique<pto::comm::urma::UrmaWorkspaceManager>();
-    if (!manager->Init(h->hccl_comm, rank_id, rank_count, symmetric_addr, symmetric_size)) {
-        LOG_WARN(
-            "[comm rank %d] URMA workspace init failed (rank_id=%u rank_count=%u size=%llu)", h->rank, rank_id,
-            rank_count, static_cast<unsigned long long>(symmetric_size)
-        );
-        return false;
-    }
-    workspace = std::move(manager);
-    return true;
-}
-
+#else
+    (void)alloc;
+    (void)instances;
 #endif
+}
 
-// Fill the per-domain async trailer from engine_mask. SDMA shares the
-// per-device provider; URMA is created per DomainAllocation. Hard-fails when
-// a declared engine is unsupported, SDMA init fails, or URMA ranks are not a
-// dense prefix of the base communicator.
+// Fill the per-domain async trailer from engine_mask. Which engines this build
+// can supply, and what each of them needs, lives in the provider registry; what
+// stays here is the mask contract (a declared engine the platform does not
+// support is a hard failure, not a hint) and the handback of domain-scope
+// ownership into DomainAllocation.
 static int fill_domain_async_table(
     CommHandle h, uint32_t engine_mask, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     void *local_buf, uint64_t win_size, DomainAllocation *alloc, CommAsyncWorkspaceTable *table_out
 ) {
     if (h == nullptr || alloc == nullptr || table_out == nullptr) return -1;
-    *table_out = make_empty_comm_async_table();
     const uint32_t supported = dma_workspace_supported_mask();
     if ((engine_mask & ~supported) != 0) {
         LOG_ERROR(
             "[comm rank %d] alloc_domain: engine_mask=0x%x not subset of supported=0x%x", h->rank, engine_mask,
             supported
         );
+        *table_out = make_empty_comm_async_table();
         return -1;
     }
 
-    if ((engine_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) != 0) {
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-        if (sdma_workspace_provider_bind(
-                &h->sdma_provider_handle, &table_out->addr[DMA_WORKSPACE_SDMA], &table_out->size[DMA_WORKSPACE_SDMA]
-            ) != 0) {
-            LOG_ERROR("[comm rank %d] alloc_domain: SDMA provider bind failed", h->rank);
-            return -1;
-        }
-#else
-        (void)local_buf;
-        (void)win_size;
-        return -1;
-#endif
-    }
+    AcquireCtx acquire_ctx{};
+    acquire_ctx.hccl_comm = h->hccl_comm;
+    acquire_ctx.sdma_bind_handle = &h->sdma_provider_handle;
+    acquire_ctx.rank_ids = rank_ids;
+    acquire_ctx.rank_count = static_cast<uint32_t>(rank_count);
+    acquire_ctx.domain_rank = domain_rank;
+    acquire_ctx.local_window = local_buf;
+    acquire_ctx.window_size = win_size;
+    acquire_ctx.rank = h->rank;
 
-    if ((engine_mask & (uint32_t{1} << DMA_WORKSPACE_URMA)) != 0) {
-#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
-        if (!rank_ids_are_dense_prefix(rank_ids, rank_count)) {
-            LOG_ERROR("[comm rank %d] alloc_domain: URMA requires dense-prefix rank_ids (rank_ids[i]==i)", h->rank);
-            return -1;
-        }
-        if (!init_urma_workspace(
-                h, domain_rank, static_cast<uint32_t>(rank_count), local_buf, win_size, alloc->urma_workspace
-            )) {
-            LOG_ERROR("[comm rank %d] alloc_domain: URMA workspace init failed", h->rank);
-            return -1;
-        }
-        table_out->addr[DMA_WORKSPACE_URMA] = reinterpret_cast<uint64_t>(alloc->urma_workspace->GetWorkspaceAddr());
-        table_out->size[DMA_WORKSPACE_URMA] = urma_workspace_bytes(static_cast<uint32_t>(rank_count));
-        if (table_out->addr[DMA_WORKSPACE_URMA] == 0) {
-            alloc->urma_workspace.reset();
-            return -1;
-        }
-#else
-        (void)rank_ids;
-        (void)rank_count;
-        (void)domain_rank;
-        return -1;
-#endif
-    }
+    EngineInstance instances[DMA_WORKSPACE_KIND_COUNT]{};
+    if (engine_registry_acquire(engine_mask, acquire_ctx, table_out, instances) != 0) return -1;
+    adopt_domain_engine_instances(alloc, instances);
     return 0;
 }
 

@@ -24,6 +24,7 @@
 #include "platform_comm/comm_async_workspace.h"
 #include "platform_comm/comm_context.h"
 #include "pto_runtime_c_api.h"
+#include "platform/onboard/host/engine_provider_registry.h"
 #include "platform/onboard/host/sdma_workspace_provider.h"
 
 #include "common/unified_log.h"
@@ -988,9 +989,44 @@ static std::string domain_ipc_announce_path(
            std::to_string(domain_rank) + ".ready";
 }
 
+// Fill the per-domain async trailer from engine_mask. Which engines this build
+// can supply, and what each of them needs, lives in the provider registry; what
+// stays here is the mask contract -- a declared engine the platform does not
+// support is a hard failure, as is a provider that will not come up, because
+// engines= is a request, not a hint.
+//
+// Called from inside the alloc paths, once the windows and the barrier are done,
+// so both backends fail engine provisioning at the same point of the sequence
+// and a domain that cannot get its engines never reaches publication on either.
+static int fill_domain_async_table(
+    CommHandle h, uint32_t engine_mask, uint32_t domain_rank, size_t rank_count, CommAsyncWorkspaceTable *table_out
+) {
+    if (h == nullptr || table_out == nullptr) return -1;
+    const uint32_t supported = dma_workspace_supported_mask();
+    if ((engine_mask & ~supported) != 0) {
+        LOG_ERROR(
+            "[comm rank %d] alloc_domain: engine_mask=0x%x not subset of supported=0x%x", h->rank, engine_mask,
+            supported
+        );
+        *table_out = make_empty_comm_async_table();
+        return -1;
+    }
+
+    AcquireCtx acquire_ctx{};
+    acquire_ctx.sdma_bind_handle = &h->sdma_provider_handle;
+    acquire_ctx.rank_count = static_cast<uint32_t>(rank_count);
+    acquire_ctx.domain_rank = domain_rank;
+    acquire_ctx.rank = h->rank;
+
+    // a2a3 has no domain-scope engine, so nothing here needs adopting; the SDMA
+    // ref stays on the comm handle for comm_destroy to drop.
+    EngineInstance instances[DMA_WORKSPACE_KIND_COUNT]{};
+    return engine_registry_acquire(engine_mask, acquire_ctx, table_out, instances);
+}
+
 static int domain_alloc_via_ipc(
     CommHandle h, uint64_t allocation_id, const uint32_t *, size_t rank_count, uint32_t domain_rank, uint64_t win_size,
-    const CommAsyncWorkspaceTable &async, DomainAllocation *out
+    uint32_t engine_mask, DomainAllocation *out
 ) {
     const int subset_n = static_cast<int>(rank_count);
     const int local_rank = static_cast<int>(domain_rank);
@@ -1061,6 +1097,9 @@ static int domain_alloc_via_ipc(
         )) {
         return -1;
     }
+
+    CommAsyncWorkspaceTable async{};
+    if (fill_domain_async_table(h, engine_mask, domain_rank, rank_count, &async) != 0) return -1;
 
     CommContext ctx{};
     ctx.rankId = domain_rank;
@@ -1164,36 +1203,6 @@ static int check_domain_alloc_args(
     return 0;
 }
 
-// Fill the per-domain async trailer from engine_mask. a2a3 supports SDMA only,
-// and its workspace is the shared per-device provider, so nothing here depends
-// on the domain's window -- the table can be built before any window exists.
-// A declared engine the platform does not support is a hard failure, as is a
-// provider that will not come up: engines= is a request, not a hint.
-static int fill_domain_async_table(CommHandle h, uint32_t engine_mask, CommAsyncWorkspaceTable *table_out) {
-    if (h == nullptr || table_out == nullptr) return -1;
-    *table_out = make_empty_comm_async_table();
-    const uint32_t supported = dma_workspace_supported_mask();
-    if ((engine_mask & ~supported) != 0) {
-        LOG_ERROR(
-            "[comm rank %d] alloc_domain: engine_mask=0x%x not subset of supported=0x%x", h->rank, engine_mask,
-            supported
-        );
-        return -1;
-    }
-    if ((engine_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) == 0) return 0;
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    if (sdma_workspace_provider_bind(
-            &h->sdma_provider_handle, &table_out->addr[DMA_WORKSPACE_SDMA], &table_out->size[DMA_WORKSPACE_SDMA]
-        ) != 0) {
-        LOG_ERROR("[comm rank %d] alloc_domain: SDMA provider bind failed", h->rank);
-        return -1;
-    }
-    return 0;
-#else
-    return -1;
-#endif
-}
-
 // Performs the per-allocation Fabric V2 exchange for one subset rank. rank_ids
 // must list participating BASE-COMM rank ids in domain rank order; this
 // rank's domain_rank must match its base rank for the same invariant
@@ -1204,7 +1213,7 @@ static int fill_domain_async_table(CommHandle h, uint32_t engine_mask, CommAsync
 // the peer imports live on `out->peer_windows` for comm_release_domain_windows.
 static FabricAttempt domain_alloc_via_fabric(
     CommHandle h, uint64_t allocation_id, const uint32_t *, size_t rank_count, uint32_t domain_rank, uint64_t win_size,
-    const CommAsyncWorkspaceTable &async, DomainAllocation *out
+    uint32_t engine_mask, DomainAllocation *out
 ) {
     const std::string &rootinfo = h->rootinfo_path;
     const uint64_t run_token = h->run_token;
@@ -1277,6 +1286,12 @@ static FabricAttempt domain_alloc_via_fabric(
     }
 
     if (!file_barrier(rootinfo, my_dr, subset_n, domain_barrier_tag(allocation_id, "fabric_ready"), run_token)) {
+        release_domain_windows(out);
+        return FabricAttempt::kError;
+    }
+
+    CommAsyncWorkspaceTable async{};
+    if (fill_domain_async_table(h, engine_mask, domain_rank, rank_count, &async) != 0) {
         release_domain_windows(out);
         return FabricAttempt::kError;
     }
@@ -1441,20 +1456,16 @@ extern "C" int comm_alloc_domain_windows(
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out) return -1;
     if (check_domain_alloc_args(h, allocation_id, rank_ids, rank_count, domain_rank, window_size) != 0) return -1;
 
-    // Built before any window exists: a2a3's only engine is SDMA, whose
-    // workspace is the shared per-device provider and knows nothing about this
-    // domain. Failing here costs nothing to unwind.
-    CommAsyncWorkspaceTable async{};
-    if (fill_domain_async_table(h, engine_mask, &async) != 0) return -1;
-
     auto alloc = std::make_unique<DomainAllocation>();
-    const FabricAttempt fabric_result =
-        domain_alloc_via_fabric(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, async, alloc.get());
+    const FabricAttempt fabric_result = domain_alloc_via_fabric(
+        h, allocation_id, rank_ids, rank_count, domain_rank, window_size, engine_mask, alloc.get()
+    );
     if (fabric_result == FabricAttempt::kError) return -1;
     if (fabric_result == FabricAttempt::kUnsupported) {
         LOG_INFO("[comm rank %d] Fabric V2 unsupported; using VMM IPC domain windows", h->rank);
-        const int rc =
-            domain_alloc_via_ipc(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, async, alloc.get());
+        const int rc = domain_alloc_via_ipc(
+            h, allocation_id, rank_ids, rank_count, domain_rank, window_size, engine_mask, alloc.get()
+        );
         if (rc != 0) return rc;
     }
 

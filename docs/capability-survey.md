@@ -247,7 +247,9 @@ fully wired, so turning it on does not help — the device path stays unreachabl
 `PTO_URMA_SUPPORTED` is the only remaining blocker: both a5 overlays are now
 built together and each domain picks its engine through `engines=`, since the
 per-engine slots live in the `CommContextBlock` trailer rather than
-`CommContext`'s single `workSpace` pair.
+`CommContext`'s single `workSpace` pair. Each slot is a record — address, size,
+backend id and the domain's rank numbering — so an engine that needs more than
+an address no longer needs a place of its own in the layout.
 
 **HCCL is bootstrap, not data movement.** The complete set of functions called
 is `HcclGetRootInfo`, `HcclCommInitRootInfo`, `HcclBarrier`, `HcclCommDestroy`.

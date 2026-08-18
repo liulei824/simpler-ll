@@ -36,6 +36,18 @@ TEST(CommContextBlockLayout, PrefixKeepsTheMirroredCommContextLayout) {
     EXPECT_EQ(sizeof(CommContextBlock), sizeof(CommContext) + sizeof(CommAsyncWorkspaceTable));
 }
 
+// Kernels index slots[] by DmaWorkspaceKind, so a stride change reads a
+// neighbouring engine's bytes instead of failing.
+TEST(CommContextBlockLayout, EngineSlotStrideIsPinned) {
+    EXPECT_EQ(sizeof(CommEngineSlot), 32u);
+    EXPECT_EQ(offsetof(CommAsyncWorkspaceTable, slots), 8u);
+    EXPECT_EQ(offsetof(CommEngineSlot, addr), 0u);
+    EXPECT_EQ(offsetof(CommEngineSlot, size), 8u);
+    EXPECT_EQ(offsetof(CommEngineSlot, backend), 16u);
+    EXPECT_EQ(offsetof(CommEngineSlot, rank_count), 20u);
+    EXPECT_EQ(offsetof(CommEngineSlot, domain_rank), 24u);
+}
+
 // Backends hand out `&block.ctx` as the device context. That only works because
 // the prefix sits at offset 0 -- pto-isa reads through the same address the
 // block was allocated at, and aclrtFree gets that same address back.
@@ -50,9 +62,28 @@ TEST(CommAsyncWorkspaceTable, EmptyTableIsStampedWithEveryEngineSlotUnprovisione
     EXPECT_EQ(table.magic, COMM_ASYNC_WORKSPACE_MAGIC);
     EXPECT_EQ(table.version, COMM_ASYNC_WORKSPACE_VERSION);
     for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
-        EXPECT_EQ(table.addr[kind], 0u) << "kind " << kind;
-        EXPECT_EQ(table.size[kind], 0u) << "kind " << kind;
+        EXPECT_EQ(table.slots[kind].addr, 0u) << "kind " << kind;
+        EXPECT_EQ(table.slots[kind].size, 0u) << "kind " << kind;
+        EXPECT_EQ(table.slots[kind].rank_count, 0u) << "kind " << kind;
     }
+}
+
+// The domain-owned fields are the reason slot writes go through one helper: an
+// engine that cannot report rank numbering still publishes the domain's.
+TEST(CommAsyncWorkspaceTable, FilledSlotCarriesTheDomainNumberingBack) {
+    CommAsyncWorkspaceTable table = make_empty_comm_async_table();
+
+    fill_comm_engine_slot(table, DMA_WORKSPACE_URMA, 0x1000ULL, 8192, 7, 2, 4);
+
+    const CommEngineSlot &urma = table.slots[DMA_WORKSPACE_URMA];
+    EXPECT_EQ(urma.addr, 0x1000ULL);
+    EXPECT_EQ(urma.size, 8192u);
+    EXPECT_EQ(urma.backend, 7u);
+    EXPECT_EQ(urma.domain_rank, 2u);
+    EXPECT_EQ(urma.rank_count, 4u);
+    // Filling one engine must not disturb another's slot.
+    EXPECT_EQ(table.slots[DMA_WORKSPACE_SDMA].addr, 0u);
+    EXPECT_EQ(table.slots[DMA_WORKSPACE_SDMA].rank_count, 0u);
 }
 
 // The whole point of building the block as one value is that a single copy
@@ -74,6 +105,6 @@ TEST(CommAsyncWorkspaceTable, BlockConstructionCopiesTheContextAndStampsTheTrail
     EXPECT_EQ(block.ctx.winSize, 4096u);
     EXPECT_EQ(block.ctx.windowsIn[3], 0xdeadbeefULL);
     EXPECT_EQ(block.async.magic, COMM_ASYNC_WORKSPACE_MAGIC);
-    EXPECT_EQ(block.async.addr[DMA_WORKSPACE_SDMA], 0u);
-    EXPECT_EQ(block.async.addr[DMA_WORKSPACE_URMA], 0u);
+    EXPECT_EQ(block.async.slots[DMA_WORKSPACE_SDMA].addr, 0u);
+    EXPECT_EQ(block.async.slots[DMA_WORKSPACE_URMA].addr, 0u);
 }

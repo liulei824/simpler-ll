@@ -28,6 +28,10 @@
  *   - a5 onboard: SDMA and/or URMA (independent CMake options; domain trailer
  *     slots via allocate_domain(engines=...); URMA is always per-domain)
  *   - simulation / host_build_graph: mask 0 (reject non-empty requirements)
+ *
+ * No backend supplies RoCE: peers of an allocate_domain member are always on
+ * this host and reachable by mapping, so the kind exists only to keep the slot
+ * layout shared with the cross-node path, and declaring it hard-fails.
  */
 
 #ifndef PLATFORM_COMMON_DMA_WORKSPACE_H_
@@ -36,7 +40,8 @@
 enum DmaWorkspaceKind {
     DMA_WORKSPACE_SDMA = 0,  // PTO-ISA async-SDMA (a2a3): TPREFETCH_ASYNC / TGET_ASYNC / TPUT_ASYNC
     DMA_WORKSPACE_URMA = 1,  // PTO-ISA async-URMA (a5): per-domain, via allocate_domain(engines=)
-    DMA_WORKSPACE_KIND_COUNT = 2,
+    DMA_WORKSPACE_ROCE = 2,  // PTO-ISA async-RoCE: cross-node only, no provider on this path
+    DMA_WORKSPACE_KIND_COUNT = 3,
 };
 
 #endif  // PLATFORM_COMMON_DMA_WORKSPACE_H_
