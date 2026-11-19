@@ -193,6 +193,10 @@ overflow the per-run SHM record buffer ("records dropped"); pypto-lib warns
 about the same thing for `decode_fwd.py --fwd-layers`. Capture on a smaller
 harvest if you need a clean trace.
 
+[Varying-input mode](#varying-input-mode) is the step loop that rewrites three
+inputs and reads `out` back on every step. The `--rounds` commands above leave
+that flag off.
+
 ## Status — a5 port
 
 Passes on a5 silicon against the same torch reference as the a2a3 source, at
@@ -213,6 +217,218 @@ Correctness mode materializes the host fixture once, uploads that same fixture,
 computes the torch golden in place, then reads back `out`, `k_cache`, and
 `v_cache` one at a time after the last round. The freshly allocated `out` buffer
 is not uploaded because the final `copy_out` task overwrites every element.
+
+## Varying-input mode
+
+`--varying-input` keeps the one-time `Worker.malloc` and the one-time fixture
+upload. Each step then rewrites three inputs, calls `worker.run`, and copies
+`out` back. The flag defaults to off. Without it, `--steps`,
+`--start-seq-len`, `--warmup-steps`, `--step-record`, and `--save-out` are
+ignored, and the driver stays on the path in
+[Memory and round behavior](#memory-and-round-behavior). The exit code and
+`[qwen] PASSED` mean the same thing on both paths.
+
+### Flags
+
+| Flag | Type / default | Meaning |
+| ---- | -------------- | ------- |
+| `--varying-input` | `store_true` / `False` | Run the step loop |
+| `--steps` | int / `200` | Steps to run and record, including warmup. Takes effect only with `--varying-input` |
+| `--start-seq-len` | int / `None` | `seq_len` of step 0. `None` falls back to `--seq-len` (default `3500`) |
+| `--warmup-steps` | int / `3` | Leading steps still run and are recorded. The steady-state summary leaves them out |
+| `--step-record` | path / `None` | JSONL path for the per-step record. `None` prints the summary and writes no JSONL file |
+| `--save-out` | path / `None` | Append every step's full `out` as raw bf16 bytes. When `--step-record` is set and this flag is omitted, the dump is that path's directory and stem with a `.out.bin` suffix. An explicit `""`, or no `--step-record`, writes no dump |
+
+`run()` checks the combination before compilation and before the fixture
+upload. A violation raises `ValueError`:
+
+- With `--varying-input`, `rounds` must be 1. The step loop and the `--rounds`
+  loop are mutually exclusive.
+- `steps >= 1` and `0 <= warmup_steps < steps`.
+- `start_seq_len >= 1` and `start_seq_len + steps - 1 <= 5500` (`MAX_SEQ`).
+  The error names `max_steps(start_seq_len)`, which is
+  `5500 - start_seq_len + 1`. A longer sequence indexes `rope_cos` /
+  `rope_sin` past the last row.
+- With `--varying-input` and without `--skip-golden`, `steps` must be 1.
+  The golden is one forward of one input set.
+- The parent directory of `--save-out` must already exist and be writable.
+  When the target file already exists, `run()` raises `ValueError` and
+  leaves that file untouched.
+- Without `--varying-input`, the five flags above are ignored.
+
+```bash
+python examples/a5/tensormap_and_ringbuffer/qwen3_14b_decode/main.py \
+    -p a5 -d ${DEVICE} --varying-input --skip-golden \
+    --steps 200 --start-seq-len 3500 --warmup-steps 3 \
+    --step-record /tmp/qwen3_steps.jsonl
+```
+
+`--step-record` is set and `--save-out` is omitted, so this also writes
+`/tmp/qwen3_steps.out.bin`. Pass `--save-out ""` to keep the JSONL and skip
+the binary dump.
+
+- `--varying-input --skip-golden` uploads the fixture, skips the torch
+  golden, and on every step generates the inputs, takes the latency window
+  below, then checksums `out` and appends the records. It prints the summary
+  and closes the files.
+- `--varying-input` without `--skip-golden` (so `--steps 1`) builds the
+  fixture, replaces `hidden_states`, `seq_lens`, and `slot_mapping` in place
+  with step 0, uploads, runs `_decode_golden`, runs that one step through the
+  same timing and record path, then `_copy_and_compare`.
+- Without `--varying-input`, the driver runs the `--rounds` loop and, when a
+  golden was built, one `_copy_and_compare` after the last round.
+
+### Inputs each step
+
+After the upload, only three tensors are written again. Each write is
+`worker.copy_to` into the buffer already allocated for that name. The step
+keeps the existing task arguments, the existing device allocations, and the
+same orchestration.
+
+| Tensor | dtype / shape | Each step |
+| ------ | ------------- | --------- |
+| `hidden_states` | bf16 `(16, 5120)`, 160 KiB | a new random hidden state |
+| `seq_lens` | int32 `(16,)` | all 16 lanes set to `start_seq_len + step` |
+| `slot_mapping` | int32 `(16,)` | recomputed from `seq_lens` |
+
+Step `k` (from 0, warmup included) has `seq_len = start_seq_len + k`. Position
+advance is entirely that change to `seq_lens`.
+
+The rest of the fixture stays resident for the whole run:
+
+- `rope_cos` and `rope_sin` are the full `(5500, 128)` fp32 tables, covering
+  positions 0 through 5499. The kernel indexes them at `seq_lens[b] - 1`.
+- `block_table`, shape `(688,)`, is the identity table over all `16×43`
+  physical pages. This fixture keeps that full-pool table on every step.
+- The eleven weight tensors are uploaded once and reused.
+- `k_cache` and `v_cache` stay resident. The attention extern writes the new
+  row selected by `slot_mapping`. Each step uses a new slot, so the row
+  written on the previous step stays as it was.
+
+### Latency
+
+`latency_us` is the primary per-step latency: a single host wall clock. The
+clock starts before the first `copy_to` and stops after `copy_from(out)`
+returns. With `t0` and `t1` taken from `time.monotonic_ns()` at those two
+points, `latency_us = (t1 - t0) / 1000` (microseconds). The window contains,
+in order, the three `copy_to` calls, the blocking `worker.run`, and
+`copy_from(out)`.
+
+`gen_us` (building this step's inputs), `checksum_us` (the `out` checksum and
+digest), and `io_us` (appending the JSONL line and the `out` bytes, then
+flushing both) sit outside that window. The host buffer that receives `out`
+is allocated once before the loop and reused, so that allocation is outside
+the window as well.
+
+Inside the window the driver also records three segments: `copy_in_us` (the
+three `copy_to` calls), `run_us` (`worker.run`), and `copy_out_us`
+(`copy_from(out)`).
+
+```text
+segments_us = copy_in_us + run_us + copy_out_us
+glue_us = latency_us - segments_us
+```
+
+`segments_us` is the sum of those three segments. The step latency is
+`latency_us`. `glue_us` is the Python glue and the timing calls between the
+segments, so `segments_us <= latency_us` and `glue_us >= 0`.
+
+The second layer is the `chip.run` trace. `[STRACE]` stays on, each step is
+one `chip.run`, and the log holds one round line per step:
+
+```bash
+python -m simpler_setup.tools.strace_timing <log> --rounds-table
+```
+
+`<log>` is the driver stdout. `--rounds-table` prints one row per step,
+including Host / Device / Orch / Sched, on the same definitions as a
+fixed-input `--rounds` run.
+That table explains the composition of `latency_us`. `copy_to` and
+`copy_from` are bare copies and sit outside the `chip.run` tree, so
+`latency_us` minus the `chip.run` host time is the three input copies, the
+`out` copy, and the Python driver overhead around them.
+
+### Records
+
+With `--step-record`, the driver writes JSONL. The first line is one `meta`
+object, and each step appends one `step` object. Every time value is a float
+number of microseconds. The file is opened before the loop, and the `meta`
+line is flushed before step 0. Each later append is flushed outside the
+`latency_us` window. An early exit leaves a valid JSONL prefix.
+
+`meta` fields:
+
+| Field | Value |
+| ----- | ----- |
+| `kind` | `"meta"` |
+| `schema` | `"phase2-v1"` |
+| `case` | case name |
+| `platform` | platform passed on the command line |
+| `device` | device id |
+| `seed` | fixture seed |
+| `start_seq_len` | `seq_len` of step 0 |
+| `steps` | step count, warmup included |
+| `warmup_steps` | warmup count |
+| `batch` | `16` |
+| `hidden` | `5120` |
+| `n_layers` | `40` |
+| `latency_window` | `"before first copy_to .. after copy_from(out) returns"` |
+| `out_dump` | file name of the bf16 dump, when a dump is written |
+| `out_dtype` | `"bfloat16"` |
+| `out_shape` | `[16, 5120]` |
+| `out_bytes_per_step` | `163840` |
+
+`step` fields:
+
+| Field | Value |
+| ----- | ----- |
+| `kind` | `"step"` |
+| `step` | index from 0, warmup included |
+| `seq_len` | `start_seq_len + step`, in `[1, 5500]` |
+| `warmup` | true when `step < warmup_steps` |
+| `latency_us` | primary host wall clock |
+| `copy_in_us` | the three `copy_to` calls, inside the window |
+| `run_us` | `worker.run`, inside the window |
+| `copy_out_us` | `copy_from(out)`, inside the window |
+| `segments_us` | `copy_in_us + run_us + copy_out_us` |
+| `glue_us` | `latency_us - segments_us` |
+| `gen_us` | input generation, outside the window |
+| `checksum_us` | checksum and digest, outside the window |
+| `io_us` | JSONL and `out.bin` append plus flush, outside the window |
+| `sum_f64` | float64 sum of `out` |
+| `max_abs` | float64 maximum absolute value of `out` |
+| `digest` | blake2b over the raw bf16 bytes, `digest_size=8`, 16 hex digits |
+| `finite` | true when `torch.isfinite(out).all()` holds |
+| `out_offset` | byte offset of this step in the dump, equal to `step * 163840` |
+
+`digest` is the byte-for-byte check. `sum_f64` and `max_abs` describe
+magnitude. The bytes hashed into `digest` are the bytes appended to the dump.
+
+`--save-out` appends that raw bf16 image to one binary file. Each step is
+`163840` bytes (`16 * 5120 * 2`). Step `k` begins at offset `k * 163840`.
+The number of complete steps in the file is its length divided by `163840`,
+and that count matches the number of flushed `step` lines. The dump is
+appended and flushed on the same schedule as the JSONL, so a partial file is
+a valid prefix of complete steps. `load_saved_out(path, step)` in
+`simpler_setup.goldens.qwen3_14b_decode_steps` reads step `k` back as a bf16
+tensor.
+
+After the last step the driver prints a steady-state summary on stdout.
+Warmup steps are left out of the percentiles, the buckets, and the slope.
+Percentiles are nearest-rank (`sorted[ceil(q * n) - 1]`). The steady steps
+are split into 10 buckets of width `max(1, steady // 10)`, where `steady` is
+`steps - warmup_steps`. The slope is a least-squares fit of `latency_us` on
+those steady steps, in microseconds per step.
+
+```text
+[qwen][steps] n=500 warmup=3 steady=497 seq=3500..3999 record=<path> outdump=<path>
+[qwen][pctl] metric=latency_us p50=... p90=... p99=... min=... max=...
+[qwen][pctl] metric=run_us p50=...
+[qwen][pctl] metric=copy_in_us|copy_out_us|segments_us|glue_us|gen_us|checksum_us|io_us ...
+[qwen][bucket] steps=3-52 seq=3503-3552 latency_us_p50=... run_us_p50=...
+[qwen][slope] metric=latency_us us_per_step=0.0123
+[qwen][digest] first=<hex> last=<hex> nonfinite_steps=0 out_bytes=81920000
+```
 
 ## Historical cost
 

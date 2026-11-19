@@ -32,14 +32,26 @@ All entry parameters live in persistent L2 device allocations. The fixture is
 generated and uploaded one tensor at a time before the first round; subsequent
 rounds reuse the same addresses without runtime staging or automatic copy-back.
 `--skip-golden` skips only torch computation and explicit output readback.
+
+`--varying-input` keeps that single upload. Each step copies a new
+``hidden_states``, ``seq_lens``, and ``slot_mapping`` into the same device
+buffers, runs once, and copies ``out`` back. Per-step latency is the host wall
+clock from before the first of those copies until ``copy_from(out)`` returns.
+``--steps``, ``--start-seq-len``, ``--warmup-steps``, ``--step-record``, and
+``--save-out`` apply only with ``--varying-input``; otherwise they are ignored.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import json
+import math
+import os
 import sys
+import time
 from pathlib import Path
+from typing import BinaryIO, NamedTuple, TextIO
 
 import torch
 from simpler.buffer import Buffer
@@ -50,6 +62,9 @@ from simpler.worker import Worker
 from simpler_setup import SceneTestCase, TaskArgsBuilder, scene_test
 from simpler_setup.compile_pool import compile_worker_budget
 from simpler_setup.goldens.qwen3_14b_decode import (
+    BATCH,
+    HIDDEN,
+    MAX_SEQ,
     N_LAYERS,
     param_specs,
     param_tensors,
@@ -59,6 +74,15 @@ from simpler_setup.goldens.qwen3_14b_decode import (
 )
 from simpler_setup.goldens.qwen3_14b_decode import (
     generate_inputs as _decode_generate_inputs,
+)
+from simpler_setup.goldens.qwen3_14b_decode_steps import (
+    OUT_BYTES_PER_STEP,
+    OutChecksum,
+    StepInputs,
+    max_steps,
+    out_checksum,
+    out_raw_bytes,
+    step_inputs,
 )
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
 from simpler_setup.parallel_scheduler import device_range_to_list
@@ -554,6 +578,466 @@ def _copy_and_compare(worker: Worker, buffers: dict[str, Buffer], golden) -> Non
         del actual
 
 
+_VARYING_TENSOR_NAMES = ("hidden_states", "seq_lens", "slot_mapping")
+_STEP_RECORD_SCHEMA = "phase2-v1"
+_LATENCY_WINDOW = "before first copy_to .. after copy_from(out) returns"
+_STEADY_METRICS = (
+    "latency_us",
+    "run_us",
+    "copy_in_us",
+    "copy_out_us",
+    "segments_us",
+    "glue_us",
+    "gen_us",
+    "checksum_us",
+    "io_us",
+)
+# Float dust from dividing three segment spans separately. A real inversion is at least one nanosecond.
+_GLUE_ROUNDING_US = 1e-9
+
+
+class _VaryingPlan(NamedTuple):
+    """Resolved varying-input knobs. ``None`` from the preparer means the flag is off."""
+
+    seed: int
+    start_seq_len: int
+    steps: int
+    warmup_steps: int
+    record_path: Path | None
+    out_dump: Path | None
+
+
+class _VaryingRun(NamedTuple):
+    """Varying-input knobs that stay fixed for one driver invocation."""
+
+    seed: int
+    start_seq_len: int
+    steps: int
+    warmup_steps: int
+    record_path: Path | None
+    out_dump: Path | None
+    platform: str
+    device_id: int
+    case_name: str
+
+
+def _resolve_save_out(save_out: str | Path | None, record_path: Path | None) -> Path | None:
+    """Pick the raw ``out`` dump path. An empty string disables the dump."""
+    if save_out is not None and str(save_out) == "":
+        return None
+    if save_out is not None:
+        return Path(save_out)
+    if record_path is None:
+        return None
+    return record_path.with_name(f"{record_path.stem}.out.bin")
+
+
+def _require_output_parent(path: Path, flag: str) -> None:
+    parent = path.parent if path.parent.parts else Path(".")
+    if not parent.is_dir():
+        raise ValueError(f"{flag} parent directory does not exist: {parent}")
+    if not os.access(parent, os.W_OK):
+        raise ValueError(f"{flag} parent directory is not writable: {parent}")
+
+
+def _validate_varying_input(
+    *,
+    rounds: int,
+    skip_golden: bool,
+    steps: int,
+    start_seq_len: int,
+    warmup_steps: int,
+    record_path: Path | None,
+    out_dump: Path | None,
+) -> None:
+    """Reject varying-input combinations before compile or fixture upload."""
+    if rounds != 1:
+        raise ValueError(f"--varying-input requires --rounds 1, got {rounds}")
+    if steps < 1:
+        raise ValueError(f"--steps must be >= 1, got {steps}")
+    if warmup_steps < 0 or warmup_steps >= steps:
+        raise ValueError(
+            f"--warmup-steps must satisfy 0 <= warmup_steps < steps, got warmup_steps={warmup_steps}, steps={steps}"
+        )
+    last_seq = start_seq_len + steps - 1
+    if start_seq_len < 1 or last_seq > MAX_SEQ:
+        allowed = max_steps(start_seq_len)
+        raise ValueError(
+            f"start_seq_len + steps - 1 = {last_seq} is outside [1, {MAX_SEQ}] "
+            f"(start_seq_len={start_seq_len}, steps={steps}); max_steps({start_seq_len})={allowed}"
+        )
+    if not skip_golden and steps != 1:
+        raise ValueError(f"--varying-input without --skip-golden requires --steps 1, got {steps}")
+    if record_path is not None:
+        _require_output_parent(record_path, "--step-record")
+    if out_dump is not None:
+        _require_output_parent(out_dump, "--save-out")
+        if out_dump.exists():
+            raise ValueError(f"--save-out refuses to overwrite existing file: {out_dump}")
+
+
+def _prepare_varying_input(  # noqa: PLR0913 -- one knob per varying-input CLI flag
+    *,
+    varying_input: bool,
+    rounds: int,
+    skip_golden: bool,
+    seed: int,
+    seq_len: int,
+    steps: int,
+    start_seq_len: int | None,
+    warmup_steps: int,
+    step_record: str | Path | None,
+    save_out: str | Path | None,
+) -> _VaryingPlan | None:
+    """Resolve and check varying-input flags. ``None`` leaves the fixed-input path unchanged."""
+    if not varying_input:
+        return None
+    resolved_start = seq_len if start_seq_len is None else start_seq_len
+    record_path = None if step_record is None else Path(step_record)
+    out_dump = _resolve_save_out(save_out, record_path)
+    _validate_varying_input(
+        rounds=rounds,
+        skip_golden=skip_golden,
+        steps=steps,
+        start_seq_len=resolved_start,
+        warmup_steps=warmup_steps,
+        record_path=record_path,
+        out_dump=out_dump,
+    )
+    return _VaryingPlan(
+        seed=seed,
+        start_seq_len=resolved_start,
+        steps=steps,
+        warmup_steps=warmup_steps,
+        record_path=record_path,
+        out_dump=out_dump,
+    )
+
+
+def _diagnostic_rounds(plan: _VaryingPlan | None, rounds: int) -> int:
+    """Round count seen by diagnostic gating. Varying input uses the step count."""
+    if plan is None:
+        return rounds
+    return plan.steps
+
+
+def _announce_varying(plan: _VaryingPlan | None) -> None:
+    if plan is None:
+        return
+    record_text = "-" if plan.record_path is None else str(plan.record_path)
+    dump_text = "-" if plan.out_dump is None else str(plan.out_dump)
+    print(
+        f"[qwen] varying-input steps={plan.steps} start_seq_len={plan.start_seq_len} "
+        f"warmup_steps={plan.warmup_steps} record={record_text} outdump={dump_text}",
+        flush=True,
+    )
+
+
+def _install_step0_inputs(golden, *, seed: int, start_seq_len: int) -> None:
+    """Overwrite the fixture tensors that upload and the torch golden both read."""
+    step0 = step_inputs(seed, start_seq_len, 0)
+    for name in _VARYING_TENSOR_NAMES:
+        getattr(golden, name).copy_(getattr(step0, name))
+
+
+def _json_line(payload: dict) -> str:
+    return json.dumps(payload, ensure_ascii=True) + "\n"
+
+
+def _window_timings(latency_ns: int, copy_in_ns: int, run_ns: int, copy_out_ns: int) -> dict[str, float]:
+    """Split one latency window into segment sums. ``glue_us`` is the uncovered remainder."""
+    copy_in_us = copy_in_ns / 1000.0
+    run_us = run_ns / 1000.0
+    copy_out_us = copy_out_ns / 1000.0
+    latency_us = latency_ns / 1000.0
+    segments_us = copy_in_us + run_us + copy_out_us
+    glue_us = latency_us - segments_us
+    if -_GLUE_ROUNDING_US < glue_us < 0.0:
+        copy_out_us += glue_us
+        segments_us = copy_in_us + run_us + copy_out_us
+        glue_us = latency_us - segments_us
+    return {
+        "latency_us": latency_us,
+        "copy_in_us": copy_in_us,
+        "run_us": run_us,
+        "copy_out_us": copy_out_us,
+        "segments_us": segments_us,
+        "glue_us": glue_us,
+    }
+
+
+def _timed_varying_window(
+    worker: Worker,
+    chip_handle,
+    task_args,
+    config: CallConfig,
+    buffers: dict[str, Buffer],
+    out_host: torch.Tensor,
+    si: StepInputs,
+) -> dict[str, float]:
+    """Host wall clock from before the first ``copy_to`` until ``copy_from(out)`` returns."""
+    t0 = time.monotonic_ns()
+    copy_in_t0 = time.monotonic_ns()
+    worker.copy_to(buffers["hidden_states"], si.hidden_states)
+    worker.copy_to(buffers["seq_lens"], si.seq_lens)
+    worker.copy_to(buffers["slot_mapping"], si.slot_mapping)
+    copy_in_t1 = time.monotonic_ns()
+    run_t0 = time.monotonic_ns()
+    worker.run(chip_handle, task_args, config)
+    run_t1 = time.monotonic_ns()
+    copy_out_t0 = time.monotonic_ns()
+    worker.copy_from(out_host, buffers["out"])
+    copy_out_t1 = time.monotonic_ns()
+    t1 = time.monotonic_ns()
+    return _window_timings(t1 - t0, copy_in_t1 - copy_in_t0, run_t1 - run_t0, copy_out_t1 - copy_out_t0)
+
+
+def _step_meta(varying: _VaryingRun) -> dict:
+    return {
+        "kind": "meta",
+        "schema": _STEP_RECORD_SCHEMA,
+        "case": varying.case_name,
+        "platform": varying.platform,
+        "device": varying.device_id,
+        "seed": varying.seed,
+        "start_seq_len": varying.start_seq_len,
+        "steps": varying.steps,
+        "warmup_steps": varying.warmup_steps,
+        "batch": BATCH,
+        "hidden": HIDDEN,
+        "n_layers": N_LAYERS,
+        "latency_window": _LATENCY_WINDOW,
+        "out_dump": None if varying.out_dump is None else varying.out_dump.name,
+        "out_dtype": "bfloat16",
+        "out_shape": [BATCH, HIDDEN],
+        "out_bytes_per_step": OUT_BYTES_PER_STEP,
+    }
+
+
+def _commit_step_record(
+    jsonl: TextIO | None,
+    out_fh: BinaryIO | None,
+    out_host: torch.Tensor,
+    si: StepInputs,
+    checksum: OutChecksum,
+    window: dict[str, float],
+    *,
+    warmup: bool,
+    gen_us: float,
+    checksum_us: float,
+) -> dict:
+    """Append this step's dump and JSONL line. Both writes sit outside the latency window."""
+    io_t0 = time.monotonic_ns()
+    if out_fh is not None:
+        raw = out_raw_bytes(out_host)
+        if len(raw) != OUT_BYTES_PER_STEP:
+            raise RuntimeError(f"out dump step is {len(raw)} bytes, expected {OUT_BYTES_PER_STEP}")
+        out_fh.write(raw)
+        out_fh.flush()
+    row = {
+        "kind": "step",
+        "step": si.step,
+        "seq_len": si.seq_len,
+        "warmup": warmup,
+        "latency_us": window["latency_us"],
+        "copy_in_us": window["copy_in_us"],
+        "run_us": window["run_us"],
+        "copy_out_us": window["copy_out_us"],
+        "segments_us": window["segments_us"],
+        "glue_us": window["glue_us"],
+        "gen_us": gen_us,
+        "checksum_us": checksum_us,
+        "io_us": (time.monotonic_ns() - io_t0) / 1000.0,
+        "sum_f64": checksum.sum_f64,
+        "max_abs": checksum.max_abs,
+        "digest": checksum.digest,
+        "finite": checksum.finite,
+        "out_offset": si.step * OUT_BYTES_PER_STEP,
+    }
+    if jsonl is None:
+        return row
+    start = jsonl.tell()
+    jsonl.write(_json_line(row))
+    jsonl.flush()
+    row["io_us"] = (time.monotonic_ns() - io_t0) / 1000.0
+    jsonl.seek(start)
+    jsonl.write(_json_line(row))
+    jsonl.truncate()
+    jsonl.flush()
+    return row
+
+
+def _nearest_rank(values: list[float], quantile: float) -> float:
+    ordered = sorted(values)
+    index = math.ceil(quantile * len(ordered)) - 1
+    return ordered[min(max(index, 0), len(ordered) - 1)]
+
+
+def _least_squares_slope(xs: list[float], ys: list[float]) -> float:
+    count = len(xs)
+    if count < 2:
+        return math.nan
+    mean_x = sum(xs) / count
+    mean_y = sum(ys) / count
+    variance = sum((x - mean_x) ** 2 for x in xs)
+    if variance == 0.0:
+        return math.nan
+    covariance = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    return covariance / variance
+
+
+def _print_varying_summary(records: list[dict], varying: _VaryingRun) -> None:
+    steady = records[varying.warmup_steps :]
+    record_text = "-" if varying.record_path is None else str(varying.record_path)
+    dump_text = "-" if varying.out_dump is None else str(varying.out_dump)
+    print(
+        f"[qwen][steps] n={varying.steps} warmup={varying.warmup_steps} steady={len(steady)} "
+        f"seq={records[0]['seq_len']}..{records[-1]['seq_len']} record={record_text} outdump={dump_text}",
+        flush=True,
+    )
+    for metric in _STEADY_METRICS:
+        values = [float(row[metric]) for row in steady]
+        print(
+            f"[qwen][pctl] metric={metric} p50={_nearest_rank(values, 0.50):.1f} "
+            f"p90={_nearest_rank(values, 0.90):.1f} p99={_nearest_rank(values, 0.99):.1f} "
+            f"min={min(values):.1f} max={max(values):.1f}",
+            flush=True,
+        )
+    width = max(1, len(steady) // 10)
+    bucket_count = len(steady) if len(steady) < 10 else 10
+    for index in range(bucket_count):
+        begin = index * width
+        end = len(steady) if index == bucket_count - 1 else (index + 1) * width
+        chunk = steady[begin:end]
+        latency = [float(row["latency_us"]) for row in chunk]
+        run = [float(row["run_us"]) for row in chunk]
+        print(
+            f"[qwen][bucket] steps={chunk[0]['step']}-{chunk[-1]['step']} "
+            f"seq={chunk[0]['seq_len']}-{chunk[-1]['seq_len']} "
+            f"latency_us_p50={_nearest_rank(latency, 0.50):.1f} run_us_p50={_nearest_rank(run, 0.50):.1f}",
+            flush=True,
+        )
+    slope = _least_squares_slope([float(row["step"]) for row in steady], [float(row["latency_us"]) for row in steady])
+    print(f"[qwen][slope] metric=latency_us us_per_step={slope:.4f}", flush=True)
+    nonfinite = sum(1 for row in records if not row["finite"])
+    out_bytes = 0 if varying.out_dump is None else varying.steps * OUT_BYTES_PER_STEP
+    print(
+        f"[qwen][digest] first={records[0]['digest']} last={records[-1]['digest']} "
+        f"nonfinite_steps={nonfinite} out_bytes={out_bytes}",
+        flush=True,
+    )
+
+
+def _open_out_dump(path: Path) -> BinaryIO:
+    try:
+        return path.open("xb")
+    except FileExistsError as exc:
+        raise ValueError(f"--save-out refuses to overwrite existing file: {path}") from exc
+
+
+def _maybe_install_step0(golden, plan: _VaryingPlan | None) -> None:
+    if plan is None:
+        return
+    _install_step0_inputs(golden, seed=plan.seed, start_seq_len=plan.start_seq_len)
+
+
+def _run_rounds_or_steps(
+    worker: Worker,
+    chip_handle,
+    task_args,
+    config: CallConfig,
+    buffers: dict[str, Buffer],
+    *,
+    rounds: int,
+    plan: _VaryingPlan | None,
+    platform: str,
+    device_id: int,
+) -> None:
+    """Fixed inputs repeat ``worker.run``. Varying input refreshes three buffers per step."""
+    if plan is None:
+        # KV writes are intentionally not reset between rounds. Fixed inputs and
+        # slot_mapping make them idempotent, so the one-round golden remains valid.
+        for round_idx in range(rounds):
+            print(f"[qwen] round {round_idx + 1}/{rounds}", flush=True)
+            worker.run(chip_handle, task_args, config)
+        return
+    _run_varying_steps(
+        worker,
+        chip_handle,
+        task_args,
+        config,
+        buffers,
+        _VaryingRun(
+            seed=plan.seed,
+            start_seq_len=plan.start_seq_len,
+            steps=plan.steps,
+            warmup_steps=plan.warmup_steps,
+            record_path=plan.record_path,
+            out_dump=plan.out_dump,
+            platform=platform,
+            device_id=device_id,
+            case_name=TestQwen314BDecode.CASES[0]["name"],
+        ),
+    )
+
+
+def _run_varying_steps(
+    worker: Worker,
+    chip_handle,
+    task_args,
+    config: CallConfig,
+    buffers: dict[str, Buffer],
+    varying: _VaryingRun,
+) -> None:
+    """Step loop: generate, time the dispatch window, then checksum and append records."""
+    out_host = torch.empty(BATCH, HIDDEN, dtype=torch.bfloat16)
+    jsonl: TextIO | None = None
+    out_fh: BinaryIO | None = None
+    try:
+        if varying.record_path is not None:
+            jsonl = varying.record_path.open("w", encoding="utf-8", newline="\n")
+            jsonl.write(_json_line(_step_meta(varying)))
+            jsonl.flush()
+        if varying.out_dump is not None:
+            out_fh = _open_out_dump(varying.out_dump)
+        records: list[dict] = []
+        for step in range(varying.steps):
+            gen_t0 = time.monotonic_ns()
+            si = step_inputs(varying.seed, varying.start_seq_len, step)
+            gen_us = (time.monotonic_ns() - gen_t0) / 1000.0
+            window = _timed_varying_window(worker, chip_handle, task_args, config, buffers, out_host, si)
+            checksum_t0 = time.monotonic_ns()
+            checksum = out_checksum(out_host)
+            checksum_us = (time.monotonic_ns() - checksum_t0) / 1000.0
+            row = _commit_step_record(
+                jsonl,
+                out_fh,
+                out_host,
+                si,
+                checksum,
+                window,
+                warmup=step < varying.warmup_steps,
+                gen_us=gen_us,
+                checksum_us=checksum_us,
+            )
+            records.append(row)
+            if not checksum.finite:
+                print(f"[qwen][warn] step {step} out is non-finite", flush=True)
+            print(
+                f"[qwen] step {step + 1}/{varying.steps} seq={si.seq_len} "
+                f"warmup={str(step < varying.warmup_steps).lower()} "
+                f"latency_us={window['latency_us']:.1f} run_us={window['run_us']:.1f} "
+                f"finite={str(checksum.finite).lower()}",
+                flush=True,
+            )
+        _print_varying_summary(records, varying)
+    finally:
+        if jsonl is not None:
+            jsonl.close()
+        if out_fh is not None:
+            out_fh.close()
+
+
 def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     device_ids,
     platform: str,
@@ -566,6 +1050,12 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
     skip_golden: bool = False,
     seed: int = 1234,
     seq_len: int = 3500,
+    varying_input: bool = False,
+    steps: int = 200,
+    start_seq_len: int | None = None,
+    warmup_steps: int = 3,
+    step_record: str | Path | None = None,
+    save_out: str | Path | None = None,
     enable_chip_swimlane: int = 0,
     dump_args: int = 0,
     enable_pmu: int = 0,
@@ -581,6 +1071,18 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         raise ValueError("qwen3_14b_decode needs one device")
     if rounds <= 0:
         raise ValueError(f"rounds must be positive, got {rounds}")
+    varying = _prepare_varying_input(
+        varying_input=varying_input,
+        rounds=rounds,
+        skip_golden=skip_golden,
+        seed=seed,
+        seq_len=seq_len,
+        steps=steps,
+        start_seq_len=start_seq_len,
+        warmup_steps=warmup_steps,
+        step_record=step_record,
+        save_out=save_out,
+    )
 
     spec = _chip_spec(orchestration_source, orchestration_function)
     cache_key = l3_compile_cache_key(
@@ -601,7 +1103,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         return 0
 
     diagnostics = effective_diagnostic_options(
-        rounds,
+        _diagnostic_rounds(varying, rounds),
         chip_swimlane=enable_chip_swimlane,
         dump_args=dump_args,
         pmu=enable_pmu,
@@ -628,6 +1130,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         f"[qwen] device={device_id} rounds={rounds} skip_golden={skip_golden}; one fixture upload",
         flush=True,
     )
+    _announce_varying(varying)
     worker = Worker(level=2, platform=platform, runtime=runtime, device_id=device_id)
     chip_handle = worker.register(chip)
     worker.init()
@@ -641,6 +1144,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         else:
             print("[qwen] materializing one fixture for upload and torch golden...", flush=True)
             golden = _decode_generate_inputs(seed=seed, seq_len=seq_len, n_layers=N_LAYERS)
+            _maybe_install_step0(golden, varying)
             _upload_fixture(
                 child_args,
                 spec["orchestration"]["signature"],
@@ -661,11 +1165,17 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
             output_prefix=output_prefix,
         )
         log_torch_backend_autoload_once()
-        # KV writes are intentionally not reset between rounds. Fixed inputs and
-        # slot_mapping make them idempotent, so the one-round golden remains valid.
-        for round_idx in range(rounds):
-            print(f"[qwen] round {round_idx + 1}/{rounds}", flush=True)
-            worker.run(chip_handle, task_args, config)
+        _run_rounds_or_steps(
+            worker,
+            chip_handle,
+            task_args,
+            config,
+            child_args.buffers,
+            rounds=rounds,
+            plan=varying,
+            platform=platform,
+            device_id=device_id,
+        )
         if golden is not None:
             _copy_and_compare(worker, child_args.buffers, golden)
     finally:
@@ -692,6 +1202,43 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--skip-golden", action="store_true", help="skip torch golden and D2H compare")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--seq-len", type=int, default=3500)
+    parser.add_argument(
+        "--varying-input",
+        action="store_true",
+        help="refresh hidden_states, seq_lens, and slot_mapping before each step",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=200,
+        help="steps to run and record, including warmup (ignored without --varying-input)",
+    )
+    parser.add_argument(
+        "--start-seq-len",
+        type=int,
+        default=None,
+        help="seq_len of step 0; default is --seq-len (ignored without --varying-input)",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=3,
+        help="leading steps recorded but excluded from steady stats (ignored without --varying-input)",
+    )
+    parser.add_argument(
+        "--step-record",
+        type=Path,
+        default=None,
+        help="JSONL path for per-step records; omit to print only (ignored without --varying-input)",
+    )
+    parser.add_argument(
+        "--save-out",
+        default=None,
+        help=(
+            "append raw bf16 out bytes; default beside --step-record as <stem>.out.bin; "
+            "empty string disables the dump (ignored without --varying-input)"
+        ),
+    )
     parser.add_argument("--enable-chip-swimlane", nargs="?", const=4, type=int, default=0)
     parser.add_argument("--dump-args", nargs="?", const=1, type=int, default=0)
     parser.add_argument("--enable-pmu", nargs="?", const=2, type=int, default=0)
@@ -719,6 +1266,12 @@ def main(argv=None, *, case_name: str | None = None, **overrides) -> int:
         skip_golden=cli.skip_golden,
         seed=cli.seed,
         seq_len=cli.seq_len,
+        varying_input=cli.varying_input,
+        steps=cli.steps,
+        start_seq_len=cli.start_seq_len,
+        warmup_steps=cli.warmup_steps,
+        step_record=cli.step_record,
+        save_out=cli.save_out,
         enable_chip_swimlane=cli.enable_chip_swimlane,
         dump_args=cli.dump_args,
         enable_pmu=cli.enable_pmu,
